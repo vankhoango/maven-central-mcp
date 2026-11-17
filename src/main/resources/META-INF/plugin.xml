@@ -1,0 +1,53 @@
+<idea-plugin>
+    <id>net.khoango.mavencentralmcp</id>
+    <name>Maven Central MCP</name>
+    <vendor>Khoa Ngo</vendor>
+
+    <description><![CDATA[
+    Runs a local <a href="https://modelcontextprotocol.io">Model Context Protocol</a> server inside the IDE so that
+    MCP clients (for example Cursor, Claude Code or VS Code) can search Maven Central and inspect artifact versions.
+    <ul>
+      <li><b>search_artifacts</b> &ndash; find artifacts by name, with pagination</li>
+      <li><b>get_artifact_info</b> &ndash; metadata for one exact coordinate</li>
+      <li><b>get_latest_version</b> &ndash; newest published vs. newest stable version, using Maven version ordering</li>
+      <li><b>get_versions</b> &ndash; paginated version list with prerelease flags</li>
+    </ul>
+    The server uses MCP Streamable HTTP at <code>http://127.0.0.1:47115/mcp</code> (port configurable in
+    <i>Settings | Tools | Maven Central MCP</i>), listens on the loopback interface only, is read-only, and never
+    reads or modifies project files. No account, telemetry or hosted backend.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <applicationListeners>
+        <listener class="net.khoango.mavencentralmcp.ide.service.McpServerAppListener"
+                  topic="com.intellij.ide.AppLifecycleListener"/>
+    </applicationListeners>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <postStartupActivity implementation="net.khoango.mavencentralmcp.ide.service.McpServerProjectActivity"/>
+        <applicationConfigurable parentId="tools"
+                                 instance="net.khoango.mavencentralmcp.ide.settings.McpSettingsConfigurable"
+                                 id="net.khoango.mavencentralmcp.settings"
+                                 displayName="Maven Central MCP"/>
+        <notificationGroup id="Maven Central MCP" displayType="BALLOON"/>
+    </extensions>
+
+    <actions>
+        <group id="MavenCentralMcp.Group" text="Maven Central MCP" popup="true">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <action id="MavenCentralMcp.ShowStatus"
+                    class="net.khoango.mavencentralmcp.ide.action.ShowServerStatusAction"
+                    text="Show Server Status"
+                    description="Show whether the Maven Central MCP server is running and its endpoint URL"/>
+            <action id="MavenCentralMcp.CopyConfig"
+                    class="net.khoango.mavencentralmcp.ide.action.CopyClientConfigAction"
+                    text="Copy Client Configuration"
+                    description="Copy an MCP client configuration snippet for this server"/>
+            <action id="MavenCentralMcp.Restart"
+                    class="net.khoango.mavencentralmcp.ide.action.RestartServerAction"
+                    text="Restart Server"
+                    description="Restart the Maven Central MCP server"/>
+        </group>
+    </actions>
+</idea-plugin>
