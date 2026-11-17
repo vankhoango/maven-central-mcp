@@ -73,6 +73,43 @@ class MavenCentralClientTest {
     }
 
     @Test
+    fun `transient 503 is retried once and can succeed`() = runTest {
+        var calls = 0
+        val fetcher = FakeFetcher { if (++calls == 1) status(503) else ok(metadataXml(listOf("1.0"))) }
+        assertEquals(listOf("1.0"), MavenCentralClient(fetcher).fetchMetadata(guava)!!.versions)
+        assertEquals(2, fetcher.requests.size)
+    }
+
+    @Test
+    fun `persistent 503 fails after two attempts and 500 or 429 or timeouts are not retried`() = runTest {
+        val unavailable = FakeFetcher { status(503) }
+        assertThrows<MavenCentralException.UpstreamUnavailable> { MavenCentralClient(unavailable).fetchMetadata(guava) }
+        assertEquals(2, unavailable.requests.size)
+
+        for (fetcher in listOf(FakeFetcher { status(500) }, FakeFetcher { status(429) }, FakeFetcher { throw HttpTimeoutException("slow") })) {
+            assertThrows<MavenCentralException> { MavenCentralClient(fetcher).fetchMetadata(guava) }
+            assertEquals(1, fetcher.requests.size)
+        }
+    }
+
+    @Test
+    fun `connection failure is retried once`() = runTest {
+        var calls = 0
+        val fetcher = FakeFetcher { if (++calls == 1) throw IOException("reset") else ok(metadataXml(listOf("2.0"))) }
+        assertEquals(listOf("2.0"), MavenCentralClient(fetcher).fetchMetadata(guava)!!.versions)
+    }
+
+    @Test
+    fun `search HTTP 400 becomes an InvalidArgument`() = runTest {
+        assertThrows<MavenCentralException.InvalidArgument> {
+            MavenCentralClient(FakeFetcher { status(400) }).searchArtifacts("g:(", 1, 0)
+        }
+        assertThrows<MavenCentralException.UpstreamUnavailable> {
+            MavenCentralClient(FakeFetcher { status(400) }).fetchMetadata(guava)
+        }
+    }
+
+    @Test
     fun `timeout maps to UpstreamTimeout`() = runTest {
         assertThrows<MavenCentralException.UpstreamTimeout> {
             MavenCentralClient(FakeFetcher { throw HttpTimeoutException("slow") }).fetchMetadata(guava)

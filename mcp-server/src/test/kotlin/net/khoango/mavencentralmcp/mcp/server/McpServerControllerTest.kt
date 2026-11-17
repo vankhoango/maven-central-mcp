@@ -66,6 +66,42 @@ class McpServerControllerTest {
     }
 
     @Test
+    fun `automatic triggers do not retry a failed port, explicit retry does`() = runBlocking {
+        val port = TestSupport.freePort()
+        val blocker = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
+        val failed = try {
+            controller.ensureRunning(port).also { assertInstanceOf(ServerState.Failed::class.java, it) }
+        } finally {
+            blocker.close()
+        }
+        assertEquals(1, created.get())
+        // A second automatic trigger (e.g. a project opening) returns the same failure without a new attempt,
+        // so the IDE shows one notification per conflict.
+        assertTrue(controller.ensureRunning(port) === failed)
+        assertEquals(1, created.get())
+        try {
+            assertInstanceOf(ServerState.Running::class.java, controller.ensureRunning(port, retryFailed = true))
+            assertEquals(2, created.get())
+        } finally {
+            controller.stop()
+        }
+    }
+
+    @Test
+    fun `port conflict is always reported as port in use, never escapes as a cancellation`() = runBlocking {
+        // Ktor CIO reports bind failures either as BindException or as a cancelled server job, depending on
+        // timing. Repeat to exercise both paths.
+        val port = TestSupport.freePort()
+        ServerSocket(port, 50, InetAddress.getByName("127.0.0.1")).use {
+            repeat(15) { attempt ->
+                val state = controller.ensureRunning(port, retryFailed = true)
+                assertInstanceOf(ServerState.Failed::class.java, state, "attempt $attempt")
+                assertTrue((state as ServerState.Failed).portInUse, "attempt $attempt: ${state.message}")
+            }
+        }
+    }
+
+    @Test
     fun `changing port restarts on the new port`() = runBlocking {
         val first = TestSupport.freePort()
         val second = TestSupport.freePort()

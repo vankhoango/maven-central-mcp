@@ -8,7 +8,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.net.BindException
+import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.util.logging.Level
 import java.util.logging.Logger
 
@@ -43,9 +46,15 @@ class McpServerController(
     /**
      * Ensures the server is running on [port]. A no-op if it is already running on that port;
      * restarts it if it runs on a different port. Failures are reported via [state], not thrown.
+     *
+     * If the last attempt on [port] failed, it is not retried unless [retryFailed] is true. This keeps
+     * repeated automatic triggers (IDE frame created, each project opened) from re-attempting a busy port
+     * and reporting the same failure again; explicit user actions pass `retryFailed = true`.
      */
-    suspend fun ensureRunning(port: Int): ServerState = mutex.withLock {
+    suspend fun ensureRunning(port: Int, retryFailed: Boolean = false): ServerState = mutex.withLock {
         if (current != null && currentPort == port) return@withLock _state.value
+        val last = _state.value
+        if (!retryFailed && last is ServerState.Failed && last.port == port) return@withLock last
         stopLocked()
         startLocked(port)
     }
@@ -78,11 +87,15 @@ class McpServerController(
             _state.value = ServerState.Stopped
             throw e
         } catch (e: Exception) {
-            val inUse = e.causes().any { it is BindException }
+            // The engine does not always surface BindException, so confirm with a direct loopback bind check.
+            val inUse = e.causes().any { it is BindException } || !isLoopbackPortFree(port)
             val message = if (inUse) {
-                "Port $port is already in use. Choose another port in Settings | Tools | Maven Central MCP."
+                "Port $port is already in use (possibly by another IDE instance). Choose another port in " +
+                    "Settings | Tools | Maven Central MCP, or close the other program and click Retry."
             } else {
-                "Could not start the MCP server on port $port: ${e.javaClass.simpleName}."
+                val root = e.causes().last()
+                "Could not start the MCP server on port $port: ${root.javaClass.simpleName}" +
+                    (root.message?.take(200)?.let { " ($it)" } ?: "") + ". See the IDE log for details."
             }
             log.log(if (inUse) Level.INFO else Level.WARNING, message, if (inUse) null else e)
             ServerState.Failed(port, message, inUse).also { _state.value = it }
@@ -102,6 +115,13 @@ class McpServerController(
             log.log(Level.WARNING, "Error while stopping the MCP server", e)
         }
         _state.value = ServerState.Stopped
+    }
+
+    private fun isLoopbackPortFree(port: Int): Boolean = try {
+        ServerSocket().use { it.bind(InetSocketAddress(EmbeddedMcpHttpServer.LOOPBACK_HOST, port)) }
+        true
+    } catch (_: IOException) {
+        false
     }
 
     private fun Throwable.causes(): Sequence<Throwable> = generateSequence(this) { it.cause?.takeIf { c -> c !== it } }

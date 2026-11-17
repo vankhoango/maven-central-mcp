@@ -15,6 +15,11 @@ import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.response.respondText
 import io.modelcontextprotocol.kotlin.sdk.server.mcpStreamableHttp
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 
 /**
  * Embedded MCP Streamable HTTP server bound to the IPv4 loopback interface only.
@@ -43,7 +48,8 @@ class EmbeddedMcpHttpServer(
     val endpointUrl: String get() = "http://$LOOPBACK_HOST:$port$path"
 
     /**
-     * Starts listening. Throws (typically [java.net.BindException]) if the port cannot be bound.
+     * Starts listening. Throws [ServerStartException] if the server cannot start (for example when the
+     * port is in use); rethrows [CancellationException] only when the caller itself was cancelled.
      * Not thread-safe; callers serialize start/stop.
      */
     suspend fun start() {
@@ -52,8 +58,11 @@ class EmbeddedMcpHttpServer(
         try {
             created.startSuspend(wait = false)
         } catch (e: Throwable) {
-            runCatching { created.stopSuspend(0, 500) }
-            throw e
+            withContext(NonCancellable) { runCatching { created.stopSuspend(0, 500) } }
+            // Ktor CIO reports a bind failure either as BindException or as a cancellation of its own
+            // server job. Only a cancellation of *our* coroutine is a real cancellation.
+            if (e is CancellationException && !currentCoroutineContext().isActive) throw e
+            throw ServerStartException(port, e)
         }
         server = created
     }
@@ -100,6 +109,10 @@ class EmbeddedMcpHttpServer(
             serverFactory.create()
         }
     }
+
+    /** The embedded server failed to start on [port]; [cause] is the engine's original failure. */
+    class ServerStartException(val port: Int, cause: Throwable) :
+        Exception("Embedded MCP server failed to start on port $port", cause)
 
     companion object {
         const val LOOPBACK_HOST = "127.0.0.1"

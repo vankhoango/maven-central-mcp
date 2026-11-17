@@ -74,6 +74,13 @@ internal object XmlParsers {
             ?.map { it.cap(200) }
             ?.take(10)
             .orEmpty()
+        // <distributionManagement><relocation> marks an artifact that moved; omitted parts default to the original.
+        val relocation = root.child("distributionManagement")?.child("relocation")
+        val relocatedTo = relocation?.let { r ->
+            val g = r.childText("groupId") ?: root.childText("groupId") ?: root.child("parent")?.childText("groupId")
+            val a = r.childText("artifactId") ?: root.childText("artifactId")
+            listOfNotNull(g, a, r.childText("version")).joinToString(":").cap(300)
+        }
         return PomMetadata(
             version = version,
             name = root.childText("name")?.cap(300),
@@ -81,6 +88,8 @@ internal object XmlParsers {
             projectUrl = root.childText("url")?.cap(500),
             scmUrl = root.child("scm")?.childText("url")?.cap(500),
             licenses = licenses,
+            relocation = relocatedTo,
+            relocationMessage = relocation?.childText("message")?.collapseWhitespace()?.cap(500),
         )
     }
 

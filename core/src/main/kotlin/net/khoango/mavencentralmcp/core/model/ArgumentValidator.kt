@@ -52,6 +52,18 @@ object ArgumentValidator {
         return v
     }
 
+    private val VARIANT_PATTERN = Regex("^[A-Za-z0-9][A-Za-z0-9\\-]{0,49}$")
+
+    /** Validates an optional platform-variant label (as reported by get_versions); blank means absent. */
+    fun optionalVariant(value: String?): String? {
+        if (value.isNullOrBlank()) return null
+        val v = value.trim()
+        if (!VARIANT_PATTERN.matches(v)) {
+            throw InvalidArgument("'variant' must be a variant label such as 'jre', 'android' or 'none'.")
+        }
+        return v.lowercase()
+    }
+
     fun query(value: String?): String {
         val v = value?.trim()
         if (v.isNullOrEmpty()) throw InvalidArgument("'query' is required and must be a non-empty string.")

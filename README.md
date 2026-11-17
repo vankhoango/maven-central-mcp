@@ -11,23 +11,45 @@ AI clients can search Maven Central and pick dependency versions. No hosted back
 
 | Tool | Purpose |
 |---|---|
-| `search_artifacts` | Search by name (`query`, optional exact `groupId`/`artifactId`/`packaging`, `limit` ≤ 50, `offset`). Returns `totalCount` and `hasMore`. |
-| `get_artifact_info` | Metadata for one `groupId` + `artifactId`: POM name/description/URL/SCM/licenses, version count, raw "latest" markers, links. |
-| `get_latest_version` | `latestPublishedVersion` (may be a prerelease) and `latestStableVersion`, plus timestamps, `uncertain`/`candidates`, and the policy text. |
-| `get_versions` | Versions newest-first (`limit` ≤ 100, `offset`, `includePrereleases`), each with a `prerelease` flag and timestamp when known. |
+| `search_artifacts` | Search (`query`, optional exact `groupId`/`artifactId`/`packaging`, `limit` ≤ 50, `offset`, `includeDescriptions`). Returns ranked results with `rankingSignals`, POM `name`/`description`/`relocatedTo` for the first 5, `totalCount`, `hasMore`. |
+| `get_artifact_info` | Metadata for one `groupId` + `artifactId`: POM name/description/URL/SCM/licenses/relocation, version count, raw "latest" markers, links. |
+| `get_latest_version` | `latestPublishedVersion` (may be a prerelease), `latestStableVersion`, per-platform `variants`, per-major `stableLines`, `uncertain`/`candidates`, `guidance` and the policy text. |
+| `get_versions` | Versions newest-first (`limit` ≤ 100, `offset`, `includePrereleases`, `variant`), each with `prerelease`, `variant` and a timestamp when known; `availableVariants` lists the labels. |
 
 Every result has a readable text summary and `structuredContent` JSON. Invalid arguments return `isError: true`
 with a message naming the bad field; unknown argument names are rejected.
+
+### Search ranking
+
+The search index orders by its own text score, so forks and repackages often come first (it lists a WSO2 repackage
+of `okhttp` above `com.squareup.okhttp3:okhttp`). For plain-word queries the plugin re-ranks the top 100 index
+matches by: exact artifactId match (query words joined with `-`), artifactId prefix/term match, a query word in the
+groupId, number of published versions (capped), recency, then index order. Each result lists these facts in
+`rankingSignals`. Ranking never labels an artifact "official"; the notes tell the client to confirm the groupId.
+
+- `groupId:artifactId` queries are exact lookups, and fall back to repository metadata if the index lacks the
+  artifact. Search expressions (`g:io.ktor*`, `a:okhttp`, `AND`/`OR`, quotes) keep the index order.
+- Results past position 100 are in index order (noted in the response).
+- The search index has no description field. Name and description come from the POM of `indexedLatestVersion` for
+  the first 5 results (one cached request each; skip with `includeDescriptions: false`). `descriptionSource` is
+  `pom:<version>`, `not_loaded` or `unavailable`. Descriptions inherited from a parent POM are not resolved.
 
 ### Version policy
 
 - **Ordering** uses Apache Maven's `ComparableVersion` (Maven's own algorithm), never string order. Version strings
   are returned exactly as published.
 - **Prerelease**: any qualifier token `alpha`, `beta`, `milestone`, `rc`, `cr`, `preview`, `pre`, `ea`, `eap`,
-  `snapshot`, `dev`, `nightly`, `incubating`, `experimental`, or a single `a`/`b`/`m` followed by a number
-  (`1.0a1`, `2.0-b3`, `5.0.M2`). `-jre`, `-android`, `.Final`, `.RELEASE`, `.GA` are stable.
-- **Latest stable** = highest non-prerelease version. If several stable variants share one release (for example
-  `33.8.0-jre` and `33.8.0-android`), `uncertain` is `true` and `candidates` lists them.
+  `snapshot`, `dev`, `nightly`, `incubating`, `experimental`, `canary`, `test`, or `a`/`b`/`m`/`pr` followed by a
+  number (`1.0a1`, `2.0-b3`, `5.0.M2`, Jackson `2.9.0.pr1`). `Final`, `GA`, `RELEASE`, `SP1`, `SEC01` are plain
+  releases.
+- **Platform variants**: other qualifiers (Guava `-jre`/`-android`, mssql-jdbc `.jre8`/`.jre11`, PostgreSQL
+  `.jre7`/`-jdbc4`) are separate, equally valid builds. `get_latest_version.variants` gives the latest stable and
+  published version of each; `get_versions` labels each version and can filter by `variant` (`none` = unqualified).
+- **Latest stable** = highest non-prerelease version by Maven ordering. When the newest release exists in several
+  variants, `uncertain` is `true` and `candidates` lists them; the Maven order between `-jre` and `-android` only
+  reflects spelling.
+- Maven ordering alone does not choose a version for a project. `guidance` says to match the platform variant, stay
+  on the project's major line unless upgrading deliberately (`stableLines`), and respect BOM-managed versions.
 - `includeSnapshots` only allows `-SNAPSHOT` versions (if any are listed) to be `latestPublishedVersion`. Maven
   Central does not normally host snapshots.
 
@@ -37,11 +59,12 @@ with a message naming the bad field; unknown argument names are rejected.
 |---|---|
 | Search, packaging, publication timestamps | `https://search.maven.org/solrsearch/select` |
 | Version lists, latest/stable resolution | `https://repo1.maven.org/maven2/<group>/<artifact>/maven-metadata.xml` |
-| Name, description, licenses, SCM | The POM of the latest stable version on `repo1.maven.org` |
+| Name, description, licenses, SCM, relocation | POMs on `repo1.maven.org` |
 
 The search index can lag far behind the repository (in November 2026 it reported Ktor `3.2.0` while the repository
 had `3.6.1`). Search results label this field `indexedLatestVersion`; use `get_latest_version` for real answers.
 Both hosts are fixed in code; tool arguments cannot change them. Responses are cached in memory for 10 minutes.
+Connection errors and HTTP 502/503/504 are retried once; timeouts and HTTP 429 are not.
 
 ## Install
 
@@ -111,8 +134,9 @@ Client verification status is tracked in [docs/MANUAL_TESTING.md](docs/MANUAL_TE
 
 | Symptom | Fix |
 |---|---|
-| "Port 47115 is already in use" | Choose another port in **Settings | Tools | Maven Central MCP**, apply, update the client URL. |
+| "Port … is already in use" balloon (one per conflict) | Another program, often a second IDE with this plugin, holds the port. Close it and click **Retry**, or choose another port in **Settings | Tools | Maven Central MCP**, apply, and update the client URL. Startup failures are also logged in `idea.log`. |
 | Client cannot connect | Is the IDE running? Check **Tools | Maven Central MCP | Show Server Status**. Use `127.0.0.1`, not `localhost`. |
+| Client stopped working after an IDE restart | Sessions do not survive a restart: the server answers an old session ID with `404 Session not found`, which tells MCP clients to start a new session. Clients that only connect at their own startup (for example when the IDE was closed then) need a manual reconnect, e.g. `/mcp` in Claude Code. |
 | `403 Forbidden` | The client sent a non-loopback `Host` or `Origin` (for example through a proxy). Connect directly. |
 | `406 Not Acceptable` | The client must send `Accept: application/json, text/event-stream` (Streamable HTTP). |
 | A search shows an old `indexedLatestVersion` | Expected index lag; call `get_latest_version`. |

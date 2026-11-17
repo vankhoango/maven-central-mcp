@@ -60,30 +60,41 @@ class MavenCentralTools(private val service: MavenCentralService) {
         name = SEARCH_ARTIFACTS,
         title = "Search Maven Central artifacts",
         description = """
-            Search Maven Central for artifacts by name. Free-text terms match groupId and artifactId tokens
-            (not descriptions); Solr expressions such as 'g:com.squareup*' or 'a:okhttp' are also accepted.
-            Optional groupId/artifactId/packaging filters are exact matches. Results are paginated
-            (limit default ${ArgumentValidator.SEARCH_DEFAULT_LIMIT}, max ${ArgumentValidator.SEARCH_MAX_LIMIT}) and include totalCount.
-            IMPORTANT: 'indexedLatestVersion' comes from the Maven Central search index, can lag behind the
-            repository and may be a prerelease. Call get_latest_version for an accurate newest stable version.
-            An empty 'results' list means nothing matched.
+            Search Maven Central for artifacts. Free-text terms (e.g. 'jackson databind', 'okhttp') match groupId and
+            artifactId tokens, not descriptions, and are re-ranked locally: exact artifactId match first, then a query
+            term in the groupId, number of published versions and recency. Each result lists its 'rankingSignals'.
+            Ranking is a heuristic and does NOT prove who publishes an artifact; several publishers often share an
+            artifactId (forks, repackages), so compare groupId, indexedVersionCount, description and relocatedTo.
+            An exact 'groupId:artifactId' query looks up that coordinate. Search expressions such as 'g:com.squareup*'
+            or 'a:okhttp' are passed through in index order. Optional groupId/artifactId/packaging filters are exact.
+            POM name/description are loaded for the first ${MavenCentralService.DESCRIPTION_LIMIT} results only
+            (descriptionSource tells whether they were read). Paginated (limit default ${ArgumentValidator.SEARCH_DEFAULT_LIMIT},
+            max ${ArgumentValidator.SEARCH_MAX_LIMIT}) with totalCount; an empty 'results' list means nothing matched.
+            'indexedLatestVersion' comes from the search index, can lag behind the repository and may be a prerelease;
+            call get_latest_version before recommending a version.
         """.trimIndent(),
         inputSchema = schema(
             required = listOf("query"),
-            "query" to stringProp("Search terms or a Maven Central search expression, e.g. 'okhttp' or 'g:io.ktor AND a:ktor-server*'. Max ${ArgumentValidator.MAX_QUERY_LENGTH} chars."),
+            "query" to stringProp("Search words ('okhttp', 'jackson databind'), an exact 'groupId:artifactId', or a search expression ('g:io.ktor AND a:ktor-server*'). Max ${ArgumentValidator.MAX_QUERY_LENGTH} chars."),
             "groupId" to stringProp("Optional exact groupId filter, e.g. 'com.squareup.okhttp3'."),
             "artifactId" to stringProp("Optional exact artifactId filter, e.g. 'okhttp'."),
             "packaging" to stringProp("Optional packaging filter, e.g. 'jar', 'aar', 'pom', 'bundle'."),
             "limit" to intProp("Maximum results to return.", ArgumentValidator.SEARCH_DEFAULT_LIMIT, 1, ArgumentValidator.SEARCH_MAX_LIMIT),
             "offset" to intProp("Number of results to skip for pagination.", 0, 0, ArgumentValidator.SEARCH_MAX_OFFSET),
+            "includeDescriptions" to boolProp("Load POM name/description for the first ${MavenCentralService.DESCRIPTION_LIMIT} results (one cached request each).", true),
         ),
         annotations = readOnly,
     ) { raw ->
         respond(SearchResultPage.serializer(), { page ->
             "Found ${page.totalCount} artifact(s); showing ${page.results.size} from offset ${page.offset}" +
-                (if (page.hasMore) " (more available)." else ".")
+                (if (page.hasMore) " (more available)." else ".") +
+                page.results.joinToString("") { r ->
+                    "\n${r.rank}. ${r.groupId}:${r.artifactId}" + (r.name?.let { " - $it" } ?: "") +
+                        (r.indexedVersionCount?.let { " ($it versions)" } ?: "") +
+                        (r.relocatedTo?.let { " [relocated to $it]" } ?: "")
+                }
         }) {
-            val args = ToolArguments(raw, setOf("query", "groupId", "artifactId", "packaging", "limit", "offset"))
+            val args = ToolArguments(raw, setOf("query", "groupId", "artifactId", "packaging", "limit", "offset", "includeDescriptions"))
             service.search(
                 SearchRequest(
                     query = ArgumentValidator.query(args.string("query")),
@@ -92,6 +103,7 @@ class MavenCentralTools(private val service: MavenCentralService) {
                     packaging = ArgumentValidator.optionalPackaging(args.string("packaging")),
                     limit = ArgumentValidator.limit(args.int("limit"), ArgumentValidator.SEARCH_DEFAULT_LIMIT, ArgumentValidator.SEARCH_MAX_LIMIT),
                     offset = ArgumentValidator.offset(args.int("offset"), ArgumentValidator.SEARCH_MAX_OFFSET),
+                    includeDescriptions = args.boolean("includeDescriptions") ?: true,
                 ),
             )
         }
@@ -126,7 +138,10 @@ class MavenCentralTools(private val service: MavenCentralService) {
             Resolve the newest published version and the newest stable version of a Maven artifact from the
             authoritative repository metadata (maven-metadata.xml), using Maven's own version ordering.
             latestPublishedVersion may be a prerelease; latestStableVersion excludes prereleases and is null if none exist.
-            If 'uncertain' is true, several variants of the same release exist (e.g. -jre and -android); see 'candidates'.
+            Platform variants (e.g. Guava -jre/-android, mssql-jdbc .jre8/.jre11) are separate, equally valid builds:
+            'variants' gives the latest stable and published version of each, and 'uncertain' is true when the newest
+            release exists in several variants ('candidates'). 'stableLines' gives the latest stable version per major
+            line. Maven ordering alone does not choose a version for a project; follow 'guidance'.
             Prerelease policy: ${VersionPolicy.POLICY_DESCRIPTION}
             includeSnapshots (default false): whether -SNAPSHOT versions, if listed, may be latestPublishedVersion.
             Maven Central does not normally host snapshots.
@@ -138,7 +153,9 @@ class MavenCentralTools(private val service: MavenCentralService) {
     ) { raw ->
         respond(LatestVersionResult.serializer(), { r ->
             "${r.groupId}:${r.artifactId} latest published: ${r.latestPublishedVersion ?: "none"}; " +
-                "latest stable: ${r.latestStableVersion ?: "none"}" + (if (r.uncertain) " (ambiguous, see candidates)" else "")
+                "latest stable: ${r.latestStableVersion ?: "none"}" +
+                (if (r.uncertain) " (released in several platform variants, see 'variants')" else "") +
+                r.variants.joinToString("") { "\n  variant ${it.variant}: stable ${it.latestStableVersion ?: "none"}" }
         }) {
             val args = ToolArguments(raw, setOf("groupId", "artifactId", "includeSnapshots"))
             service.getLatestVersion(
@@ -154,13 +171,15 @@ class MavenCentralTools(private val service: MavenCentralService) {
         description = """
             List versions of a Maven artifact, newest first by Maven version ordering (Apache Maven ComparableVersion,
             computed locally; not lexicographic and not deploy order). Version strings are returned exactly as published.
-            Each entry has a 'prerelease' flag (same policy as get_latest_version) and a publication timestamp when the
-            search index knows it. Paginated: limit default ${ArgumentValidator.VERSIONS_DEFAULT_LIMIT}, max ${ArgumentValidator.VERSIONS_MAX_LIMIT}; totalCount and hasMore are returned.
+            Each entry has a 'prerelease' flag (same policy as get_latest_version), a platform 'variant' label (null for
+            plain releases) and a publication timestamp when the search index knows it. 'availableVariants' lists the
+            labels; pass 'variant' (e.g. 'android', or 'none' for plain releases) to list one variant only. Paginated: limit default ${ArgumentValidator.VERSIONS_DEFAULT_LIMIT}, max ${ArgumentValidator.VERSIONS_MAX_LIMIT}; totalCount and hasMore are returned.
         """.trimIndent(),
         inputSchema = coordinateSchema(
             "limit" to intProp("Maximum versions to return.", ArgumentValidator.VERSIONS_DEFAULT_LIMIT, 1, ArgumentValidator.VERSIONS_MAX_LIMIT),
             "offset" to intProp("Number of versions to skip for pagination.", 0, 0, ArgumentValidator.VERSIONS_MAX_OFFSET),
             "includePrereleases" to boolProp("Include alpha/beta/RC/milestone/etc. versions.", true),
+            "variant" to stringProp("Optional platform variant to list, e.g. 'jre', 'android', or 'none' for unqualified releases."),
         ),
         annotations = readOnly,
     ) { raw ->
@@ -168,13 +187,14 @@ class MavenCentralTools(private val service: MavenCentralService) {
             "${p.groupId}:${p.artifactId}: ${p.versions.size} of ${p.totalCount} version(s) from offset ${p.offset}" +
                 (if (p.hasMore) " (more available)." else ".")
         }) {
-            val args = ToolArguments(raw, setOf("groupId", "artifactId", "limit", "offset", "includePrereleases"))
+            val args = ToolArguments(raw, setOf("groupId", "artifactId", "limit", "offset", "includePrereleases", "variant"))
             val coordinates = ArgumentValidator.coordinates(args.string("groupId"), args.string("artifactId"))
             service.getVersions(
                 coordinates,
                 limit = ArgumentValidator.limit(args.int("limit"), ArgumentValidator.VERSIONS_DEFAULT_LIMIT, ArgumentValidator.VERSIONS_MAX_LIMIT),
                 offset = ArgumentValidator.offset(args.int("offset"), ArgumentValidator.VERSIONS_MAX_OFFSET),
                 includePrereleases = args.boolean("includePrereleases") ?: true,
+                variant = ArgumentValidator.optionalVariant(args.string("variant")),
             )
         }
     }

@@ -40,14 +40,20 @@ class McpServerService(private val scope: CoroutineScope) : Disposable {
 
     val state: StateFlow<ServerState> get() = controller.state
 
-    /** Starts, restarts (port changed) or stops the server to match the current settings. */
-    fun applySettings() {
+    /**
+     * Starts, restarts (port changed) or stops the server to match the current settings.
+     *
+     * @param userInitiated true for an explicit settings Apply, which retries a port that failed before;
+     *   automatic triggers (IDE startup, project open) do not, so one conflict produces one notification.
+     */
+    fun applySettings(userInitiated: Boolean = false) {
         val settings = McpSettings.getInstance()
         val enabled = settings.enabled
         val port = settings.port
         scope.launch(Dispatchers.IO) {
             if (enabled) {
-                notifyIfFailed(controller.ensureRunning(port))
+                val before = controller.state.value
+                notifyIfNewFailure(before, controller.ensureRunning(port, retryFailed = userInitiated))
             } else {
                 controller.stop()
             }
@@ -60,15 +66,31 @@ class McpServerService(private val scope: CoroutineScope) : Disposable {
         val enabled = settings.enabled
         val port = settings.port
         scope.launch(Dispatchers.IO) {
-            if (enabled) notifyIfFailed(controller.restart(port)) else controller.stop()
+            if (enabled) {
+                val before = controller.state.value
+                notifyIfNewFailure(before, controller.restart(port))
+            } else {
+                controller.stop()
+            }
         }
     }
 
-    private fun notifyIfFailed(state: ServerState) {
-        if (state !is ServerState.Failed) return
+    /**
+     * Logs the outcome to idea.log and notifies only when this call produced a new failure, not when it
+     * returned an earlier one unchanged.
+     */
+    private fun notifyIfNewFailure(before: ServerState, after: ServerState) {
+        if (after === before) return
+        when (after) {
+            is ServerState.Running -> log.info("Maven Central MCP server listening at ${after.url}")
+            is ServerState.Failed -> log.warn("Maven Central MCP server not started: ${after.message}")
+            else -> Unit
+        }
+        if (after !is ServerState.Failed) return
         NotificationGroupManager.getInstance()
             .getNotificationGroup(NOTIFICATION_GROUP)
-            .createNotification("Maven Central MCP server not started", state.message, NotificationType.WARNING)
+            .createNotification("Maven Central MCP server not started", after.message, NotificationType.WARNING)
+            .addAction(NotificationAction.createSimpleExpiring("Retry") { restart() })
             .addAction(NotificationAction.createSimpleExpiring("Open settings") {
                 ShowSettingsUtil.getInstance().showSettingsDialog(null, McpSettingsConfigurable::class.java)
             })
@@ -82,6 +104,7 @@ class McpServerService(private val scope: CoroutineScope) : Disposable {
         thread(name = "Maven Central MCP shutdown", isDaemon = true) {
             try {
                 runBlocking { controller.stop() }
+                log.info("Maven Central MCP server stopped (service disposed)")
             } catch (e: Exception) {
                 log.warn("Failed to stop the MCP server cleanly", e)
             }

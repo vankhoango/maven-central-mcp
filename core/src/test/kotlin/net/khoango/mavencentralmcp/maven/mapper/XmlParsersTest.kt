@@ -50,6 +50,26 @@ class XmlParsersTest {
     }
 
     @Test
+    fun `parses relocation with defaults from the original coordinates`() {
+        val pom = """
+            <project><groupId>mysql</groupId><artifactId>mysql-connector-java</artifactId>
+              <distributionManagement><relocation>
+                <groupId>com.mysql</groupId><artifactId>mysql-connector-j</artifactId>
+                <message>MySQL Connector/J artifacts moved to reverse-DNS compliant Maven 2+ coordinates.</message>
+              </relocation></distributionManagement>
+            </project>
+        """.trimIndent()
+        val p = XmlParsers.parsePom(pom.toByteArray(), "8.0.33")
+        assertEquals("com.mysql:mysql-connector-j", p.relocation)
+        assertEquals("MySQL Connector/J artifacts moved to reverse-DNS compliant Maven 2+ coordinates.", p.relocationMessage)
+
+        val onlyVersion = "<project><groupId>g</groupId><artifactId>a</artifactId><distributionManagement>" +
+            "<relocation><version>2.0</version></relocation></distributionManagement></project>"
+        assertEquals("g:a:2.0", XmlParsers.parsePom(onlyVersion.toByteArray(), "1.0").relocation)
+        assertNull(XmlParsers.parsePom("<project/>".toByteArray(), "1.0").relocation)
+    }
+
+    @Test
     fun `parses top-level pom fields only`() {
         val pom = """
             <project xmlns="http://maven.apache.org/POM/4.0.0">

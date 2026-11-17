@@ -68,6 +68,43 @@ class MavenCentralToolsTest {
     }
 
     @Test
+    fun `search exposes ranking, descriptions and accepts includeDescriptions`() = runTest {
+        val r = call("search_artifacts", buildJsonObject { put("query", "lib") })
+        val hit = r.structuredContent!!["results"]!!.jsonArray.single().jsonObject
+        assertEquals("1", hit["rank"]!!.jsonPrimitive.content)
+        assertTrue(hit["rankingSignals"]!!.jsonArray.isNotEmpty())
+        assertEquals("An example.", hit["description"]!!.jsonPrimitive.content)
+        assertTrue(r.text().contains("1. com.example:lib - Example Lib"))
+        val skipped = call("search_artifacts", buildJsonObject { put("query", "lib"); put("includeDescriptions", false) })
+        assertEquals("not_loaded", skipped.structuredContent!!["results"]!!.jsonArray.single().jsonObject["descriptionSource"]!!.jsonPrimitive.content)
+        assertEquals(true, call("search_artifacts", buildJsonObject { put("query", "lib"); put("includeDescriptions", "no") }).isError)
+    }
+
+    @Test
+    fun `get_versions accepts a variant filter and validates it`() = runTest {
+        val r = call("get_versions", buildJsonObject {
+            put("groupId", "com.example"); put("artifactId", "lib"); put("variant", "none")
+        })
+        assertNotEquals(true, r.isError)
+        assertEquals("none", r.structuredContent!!["variantFilter"]!!.jsonPrimitive.content)
+        val bad = call("get_versions", buildJsonObject {
+            put("groupId", "com.example"); put("artifactId", "lib"); put("variant", "x\"y")
+        })
+        assertEquals(true, bad.isError)
+        val unknown = call("get_versions", buildJsonObject {
+            put("groupId", "com.example"); put("artifactId", "lib"); put("variant", "android")
+        })
+        assertTrue(unknown.text().startsWith("Unknown variant 'android'"))
+    }
+
+    @Test
+    fun `get_latest_version includes guidance and stable lines`() = runTest {
+        val s = call("get_latest_version", buildJsonObject { put("groupId", "com.example"); put("artifactId", "lib") }).structuredContent!!
+        assertTrue(s["guidance"]!!.jsonPrimitive.content.isNotEmpty())
+        assertEquals("1.10", s["stableLines"]!!.jsonArray.first().jsonObject["latestStableVersion"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `not found is an error result`() = runTest {
         val r = call("get_versions", buildJsonObject { put("groupId", "com.example"); put("artifactId", "missing") })
         assertEquals(true, r.isError)

@@ -1,6 +1,7 @@
 package net.khoango.mavencentralmcp.maven.api
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
@@ -20,6 +21,7 @@ import java.net.URLEncoder
 import java.net.http.HttpTimeoutException
 import java.nio.charset.StandardCharsets
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
@@ -97,7 +99,7 @@ class MavenCentralClient(
         serializer: KSerializer<SolrEnvelope<T>>,
     ): SolrResponse<T> {
         val query = params.entries.joinToString("&") { (k, v) -> "$k=${encode(v)}" }
-        val bytes = getBytes(URI.create("$SEARCH_URL?$query"), "application/json")
+        val bytes = getBytes(URI.create("$SEARCH_URL?$query"), "application/json", badRequest = INVALID_SEARCH_EXPRESSION)
             ?: throw MavenCentralException.UpstreamUnavailable("Maven Central search endpoint was not found.")
         val envelope = try {
             json.decodeFromString(serializer, bytes.toString(StandardCharsets.UTF_8))
@@ -110,10 +112,32 @@ class MavenCentralClient(
             ?: throw MavenCentralException.MalformedUpstreamResponse("Maven Central search response had no 'response' object.")
     }
 
-    /** GET with caching and error mapping. Returns null for HTTP 404. */
-    private suspend fun getBytes(uri: URI, accept: String): ByteArray? {
+    /**
+     * GET with caching and error mapping. Returns null for HTTP 404.
+     *
+     * Transient failures (connection errors, HTTP 502/503/504) are retried once after a short pause.
+     * Timeouts and HTTP 429 are not retried, so a call never waits much longer than one request timeout
+     * and rate limits are respected.
+     */
+    private suspend fun getBytes(uri: URI, accept: String, badRequest: String? = null): ByteArray? {
         val key = uri.toString()
         cache.get(key)?.let { return it }
+        var attempt = 1
+        while (true) {
+            try {
+                return fetchOnce(uri, accept, key, badRequest)
+            } catch (e: TransientFailure) {
+                if (attempt >= MAX_ATTEMPTS) throw e.mapped
+                attempt++
+                delay(RETRY_DELAY)
+            }
+        }
+    }
+
+    /** Signals a failure worth one retry; [mapped] is what the caller sees if retries are exhausted. */
+    private class TransientFailure(val mapped: MavenCentralException) : Exception(null, null, false, false)
+
+    private suspend fun fetchOnce(uri: URI, accept: String, key: String, badRequest: String?): ByteArray? {
         val response = try {
             fetcher.get(uri, accept)
         } catch (e: CancellationException) {
@@ -123,15 +147,25 @@ class MavenCentralClient(
         } catch (e: HttpTimeoutException) {
             throw MavenCentralException.UpstreamTimeout(e)
         } catch (e: IOException) {
-            throw MavenCentralException.UpstreamUnavailable("Could not reach Maven Central. Check the network connection.", e)
+            throw TransientFailure(
+                MavenCentralException.UpstreamUnavailable("Could not reach Maven Central. Check the network connection.", e),
+            )
         }
         return when (val status = response.status) {
             in 200..299 -> response.body.also { cache.put(key, it) }
             404 -> null
+            400 -> if (badRequest != null) {
+                throw MavenCentralException.InvalidArgument(badRequest)
+            } else {
+                throw MavenCentralException.UpstreamUnavailable("Maven Central rejected the request (HTTP 400).")
+            }
             429 -> throw MavenCentralException.RateLimited(parseRetryAfter(response.header("Retry-After")))
-            in 500..599 -> throw MavenCentralException.UpstreamUnavailable(
-                "Maven Central is temporarily unavailable (HTTP $status). Retry later.",
-            )
+            in 500..599 -> {
+                val error = MavenCentralException.UpstreamUnavailable(
+                    "Maven Central is temporarily unavailable (HTTP $status). Retry later.",
+                )
+                throw if (status in 502..504) TransientFailure(error) else error
+            }
             else -> throw MavenCentralException.UpstreamUnavailable("Maven Central returned unexpected HTTP status $status.")
         }
     }
@@ -143,7 +177,14 @@ class MavenCentralClient(
         /** Fixed repository root. Never derived from tool arguments. */
         const val REPOSITORY_URL = "https://repo1.maven.org/maven2"
 
-        private val SAFE_VERSION = Regex("^[A-Za-z0-9_][A-Za-z0-9_.\\-+]*$")
+        private const val MAX_ATTEMPTS = 2
+        private val RETRY_DELAY = 300.milliseconds
+
+        internal const val INVALID_SEARCH_EXPRESSION =
+            "Maven Central rejected the search expression. Use plain words (e.g. 'jackson databind'), an exact " +
+                "'groupId:artifactId', or field syntax such as 'g:com.squareup*' or 'a:okhttp'."
+
+        private val SAFE_VERSION =Regex("^[A-Za-z0-9_][A-Za-z0-9_.\\-+]*$")
 
         internal fun artifactPath(c: ArtifactCoordinates): String = "${c.groupId.replace('.', '/')}/${c.artifactId}"
 
@@ -156,13 +197,17 @@ class MavenCentralClient(
          * Builds the Solr expression for an artifact search: the user's query (free text or a Solr
          * expression such as `g:com.google*`) combined with exact field filters.
          */
-        internal fun buildSearchQuery(query: String, groupId: String?, artifactId: String?, packaging: String?): String {
+        internal fun buildSearchQuery(query: String?, groupId: String?, artifactId: String?, packaging: String?): String {
             val filters = buildList {
                 groupId?.let { add("g:${quote(it)}") }
                 artifactId?.let { add("a:${quote(it)}") }
                 packaging?.let { add("p:${quote(it)}") }
             }
-            return if (filters.isEmpty()) query else (listOf("($query)") + filters).joinToString(" AND ")
+            return when {
+                query == null -> filters.joinToString(" AND ")
+                filters.isEmpty() -> query
+                else -> (listOf("($query)") + filters).joinToString(" AND ")
+            }
         }
 
         /** Parses `Retry-After` given in seconds; HTTP-date values are ignored. Capped at one hour. */

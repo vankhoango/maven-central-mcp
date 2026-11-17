@@ -59,7 +59,7 @@ class McpSettingsConfigurable : BoundConfigurable("Maven Central MCP") {
 
     override fun apply() {
         super.apply()
-        McpServerService.getInstance().applySettings()
+        McpServerService.getInstance().applySettings(userInitiated = true)
     }
 
     override fun disposeUIResources() {

@@ -16,6 +16,8 @@ data class SearchRequest(
     val packaging: String? = null,
     val limit: Int,
     val offset: Int,
+    /** Whether to load POM name/description for the first results of the page (bounded, cached). */
+    val includeDescriptions: Boolean = true,
 )
 
 /**
@@ -30,13 +32,26 @@ data class ArtifactSummary(
     val artifactId: String,
     val indexedLatestVersion: String?,
     val packaging: String?,
-    /** Not provided by the search index; reserved for richer sources. */
+    /** Project name from the POM, when descriptions were loaded. */
+    val name: String? = null,
+    /** Project description from the POM (the search index has no description field). */
     val description: String? = null,
+    /**
+     * Where [name]/[description] came from: `pom:<version>` if the POM was read (fields may still be null if
+     * the POM has none), `not_loaded` if this result was outside the description budget, or `unavailable`.
+     */
+    val descriptionSource: String = "not_loaded",
+    /** Set when the POM declares that this artifact moved to other coordinates. */
+    val relocatedTo: String? = null,
     val url: String,
     /** Epoch milliseconds of the indexed latest version, if reported. */
     val lastUpdatedEpochMillis: Long?,
     val lastUpdated: String?,
     val indexedVersionCount: Int?,
+    /** 1-based position in this result ordering. */
+    val rank: Int = 0,
+    /** Factual reasons behind [rank]. Not an endorsement or a claim about who publishes the artifact. */
+    val rankingSignals: List<String> = emptyList(),
 )
 
 @Serializable
@@ -46,7 +61,10 @@ data class SearchResultPage(
     val offset: Int,
     val limit: Int,
     val hasMore: Boolean,
+    /** How results are ordered (local relevance ranking or upstream order). */
+    val ranking: String,
     val results: List<ArtifactSummary>,
+    val notes: List<String> = emptyList(),
 )
 
 /** Descriptive metadata from the artifact's POM. All fields are optional upstream data. */
@@ -58,6 +76,9 @@ data class PomMetadata(
     val projectUrl: String? = null,
     val scmUrl: String? = null,
     val licenses: List<String> = emptyList(),
+    /** `groupId:artifactId[:version]` this artifact was relocated to, per the POM's `<relocation>`. */
+    val relocation: String? = null,
+    val relocationMessage: String? = null,
 )
 
 @Serializable
@@ -84,6 +105,8 @@ data class ArtifactInfo(
 data class VersionEntry(
     val version: String,
     val prerelease: Boolean,
+    /** Platform variant label (e.g. `jre`, `android`), or null for a plain release. */
+    val variant: String? = null,
     /** Publication time from the search index, if the index knows this version. */
     val publishedEpochMillis: Long? = null,
     val published: String? = null,
@@ -98,6 +121,10 @@ data class VersionPage(
     val limit: Int,
     val hasMore: Boolean,
     val includePrereleases: Boolean,
+    /** The variant filter applied, if any (`none` = plain releases only). */
+    val variantFilter: String? = null,
+    /** All variant labels present for this artifact (null label shown as `none`). */
+    val availableVariants: List<String> = emptyList(),
     val ordering: String,
     val versions: List<VersionEntry>,
     val notes: List<String>,
@@ -118,6 +145,27 @@ data class LatestVersionResult(
     val uncertain: Boolean,
     /** Competing versions when [uncertain] is true. */
     val candidates: List<String>,
+    /** Latest stable/published version per platform variant (e.g. jre and android for Guava). */
+    val variants: List<VariantLatest> = emptyList(),
+    /** Latest stable version of each of the newest major lines, for projects pinned to a major version. */
+    val stableLines: List<StableLine> = emptyList(),
+    /** How to choose a version for a project; Maven ordering alone does not decide it. */
+    val guidance: String = "",
     val policy: String,
     val notes: List<String>,
+)
+
+@Serializable
+data class VariantLatest(
+    /** Variant label, or `none` for plain releases without a platform qualifier. */
+    val variant: String,
+    val latestStableVersion: String?,
+    val latestPublishedVersion: String?,
+    val versionCount: Int,
+)
+
+@Serializable
+data class StableLine(
+    val major: Long,
+    val latestStableVersion: String,
 )

@@ -31,16 +31,18 @@ class MavenCentralServiceTest {
 
     @Test
     fun `search maps results and pagination`() = runTest {
-        val body = """{"response":{"numFound":3,"start":1,"docs":[
+        val body = """{"response":{"numFound":3,"start":0,"docs":[
+            {"id":"com.other:lib-extra","g":"com.other","a":"lib-extra","latestVersion":"1.0","p":"jar","timestamp":1700000000000,"versionCount":2},
             {"id":"com.example:lib","g":"com.example","a":"lib","latestVersion":"2.0-RC1","p":"jar","timestamp":1700000000000,"versionCount":12},
             {"id":"broken"}
         ]}}"""
-        val page = service { ok(body) }.search(SearchRequest("lib", limit = 2, offset = 1))
+        val page = service { uri -> if (uri.host == "search.maven.org") ok(body) else status(404) }
+            .search(SearchRequest("lib", limit = 1, offset = 1))
         assertEquals(3, page.totalCount)
-        assertEquals(1, page.results.size)
         val hit = page.results.single()
-        assertEquals("2.0-RC1", hit.indexedLatestVersion)
-        assertEquals("https://central.sonatype.com/artifact/com.example/lib", hit.url)
+        assertEquals("com.other:lib-extra", "${hit.groupId}:${hit.artifactId}") // second after re-ranking
+        assertEquals(2, hit.rank)
+        assertEquals("https://central.sonatype.com/artifact/com.other/lib-extra", hit.url)
         assertEquals("2023-11-14T22:13:20Z", hit.lastUpdated)
         assertTrue(page.hasMore)
     }
@@ -183,6 +185,56 @@ class MavenCentralServiceTest {
         val info = svc.getArtifactInfo(lib)
         assertNull(info.indexedLatestVersion)
         assertTrue(info.notes.any { it.startsWith("Could not load search index") })
+    }
+
+    private val guavaLike = listOf(
+        "21.0", "22.0", "22.0-android", "23.0", "23.0-android", "33.7.2-jre", "33.7.2-android",
+        "33.8.0-android", "33.8.0-jre", "34.0.0-rc1-jre",
+    )
+
+    @Test
+    fun `latest version reports each platform variant separately`() = runTest {
+        val svc = service { uri -> if (uri.host == "repo1.maven.org") ok(metadataXml(guavaLike)) else ok(emptySearch) }
+        val r = svc.getLatestVersion(lib, includeSnapshots = false)
+        assertEquals("34.0.0-rc1-jre", r.latestPublishedVersion)
+        assertTrue(r.uncertain)
+        val variants = r.variants.associateBy { it.variant }
+        assertEquals(setOf("jre", "android", "none"), variants.keys)
+        assertEquals("33.8.0-jre", variants.getValue("jre").latestStableVersion)
+        assertEquals("34.0.0-rc1-jre", variants.getValue("jre").latestPublishedVersion)
+        assertEquals("33.8.0-android", variants.getValue("android").latestStableVersion)
+        assertEquals("23.0", variants.getValue("none").latestStableVersion)
+        assertTrue(r.guidance.contains("Maven ordering alone does not pick"))
+        assertTrue(r.notes.any { "equally valid" in it })
+    }
+
+    @Test
+    fun `stable lines give the latest release per major version`() = runTest {
+        val svc = service { uri ->
+            if (uri.host == "repo1.maven.org") ok(metadataXml(listOf("2.7.18", "3.4.0", "3.5.8", "4.0.0", "4.1.2", "4.2.0-RC2")))
+            else ok(emptySearch)
+        }
+        val r = svc.getLatestVersion(lib, includeSnapshots = false)
+        assertEquals(listOf(4L to "4.1.2", 3L to "3.5.8", 2L to "2.7.18"), r.stableLines.map { it.major to it.latestStableVersion })
+        assertTrue(r.variants.isEmpty())
+        assertFalse(r.uncertain)
+    }
+
+    @Test
+    fun `get_versions labels and filters variants`() = runTest {
+        val svc = service { uri -> if (uri.host == "repo1.maven.org") ok(metadataXml(guavaLike)) else ok(emptySearch) }
+        val all = svc.getVersions(lib, limit = 3, offset = 0, includePrereleases = false)
+        assertEquals(listOf("android", "jre", "none"), all.availableVariants)
+        assertEquals(listOf("jre", "android", "jre"), all.versions.map { it.variant })
+        assertTrue(all.notes.any { "parallel builds" in it })
+
+        val android = svc.getVersions(lib, limit = 10, offset = 0, includePrereleases = true, variant = "android")
+        assertEquals(listOf("33.8.0-android", "33.7.2-android", "23.0-android", "22.0-android"), android.versions.map { it.version })
+        val plain = svc.getVersions(lib, limit = 10, offset = 0, includePrereleases = true, variant = "none")
+        assertEquals(listOf("23.0", "22.0", "21.0"), plain.versions.map { it.version })
+        assertThrows<MavenCentralException.InvalidArgument> {
+            svc.getVersions(lib, limit = 10, offset = 0, includePrereleases = true, variant = "ios")
+        }
     }
 
     @Test
