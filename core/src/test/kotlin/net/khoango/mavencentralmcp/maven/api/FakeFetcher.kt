@@ -5,15 +5,27 @@ import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.CopyOnWriteArrayList
 
-/** Test double that answers requests from a routing function and records every requested URI. */
+/**
+ * Test double that answers requests from a routing function and records every requested URI.
+ *
+ * Description-keyword searches (search queries using the `tags:` field) are answered by [keywordRoute] and
+ * recorded in [keywordRequests] instead of [requests]. By default they return no matches, so tests that are not
+ * about keyword search see exactly the name-search behavior and request counts they always did.
+ */
 class FakeFetcher(
     private val headRoute: ((URI) -> FetchResponse)? = null,
+    private val keywordRoute: (URI) -> FetchResponse = { ok(EMPTY_SEARCH) },
     private val route: (URI) -> FetchResponse,
 ) : HttpFetcher {
     val requests = CopyOnWriteArrayList<URI>()
     val headRequests = CopyOnWriteArrayList<URI>()
+    val keywordRequests = CopyOnWriteArrayList<URI>()
 
     override suspend fun get(uri: URI, accept: String): FetchResponse {
+        if (uri.host == "search.maven.org" && uri.param("q")?.contains("tags:") == true) {
+            keywordRequests += uri
+            return keywordRoute(uri)
+        }
         requests += uri
         return route(uri)
     }
@@ -24,6 +36,8 @@ class FakeFetcher(
     }
 
     companion object {
+        const val EMPTY_SEARCH = """{"response":{"numFound":0,"start":0,"docs":[]}}"""
+
         fun ok(body: String, vararg headers: Pair<String, String>) =
             FetchResponse(200, body.toByteArray(), headers.associate { it.first to listOf(it.second) })
 

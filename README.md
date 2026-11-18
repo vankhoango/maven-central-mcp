@@ -19,13 +19,59 @@ AI clients can search Maven Central and pick dependency versions. No hosted back
 Every result has a readable text summary and `structuredContent` JSON. Invalid arguments return `isError: true`
 with a message naming the bad field; unknown argument names are rejected.
 
+### Feature search
+
+Plain-word queries match artifact names **and** description keywords. The search index has no description field,
+but it does index keywords derived from each POM's description (its `tags` field). The plugin runs a second query
+for artifacts whose description keywords contain every query word (grammatical words such as "to" or "the" are
+ignored) but whose names do not match, so the two result sets never overlap and `totalCount` is their exact sum.
+
+| Query | Name matches | + description-keyword matches (examples) |
+|---|---|---|
+| `speech recognition` | 1 | 17 (Vosk, DeepSpeech, Naver Speech) |
+| `speech-to-text` | 12 | 90 (Rev.ai speech-to-text, Google Cloud speech/TTS) |
+| `voice recognition` | 0 | 5 (Yandex SpeechKit, Microsoft speaker recognition) |
+| `audio transcription` | 0 | 1 |
+
+Counts are from the live index in November 2026. Keyword matches carry the signal `description keywords contain all
+query terms …` and score below an equally established name match. Each response reports `nameMatchCount`,
+`descriptionKeywordMatchCount` and `descriptionKeywordMatching`: `applied`; `unavailable` (the keyword query failed, so
+`totalCount` covers name matches only, with a note); `no_meaningful_words` (only grammatical words or punctuation,
+e.g. `to the`); or `not_applicable`.
+
+Query normalization: matching is case-insensitive; extra whitespace and punctuation between words (`json, parser`,
+`json & parser`) are separators; trailing sentence punctuation (`json parser!`, `http client?`) is ignored and reported
+in a note. A word joined by punctuation without spaces (`speech-to-text`, `json,parser`) is a phrase for name matching,
+as in the index, so word order matters (`text-to-speech` is not a name match for `speech-to-text`; it can still be a
+description-keyword match). The index drops symbols such as `+` and `#`, so `c++` and `c#` both match `c`; the response says so.
+Grammatical words (`to`, `for`, `with`, …) are not used as description keywords or as ranking signals.
+
+Description keywords also match the plain plural of a query word (`migration` also matches `migrations`, which
+brings Flyway into `database migration`); no other inflections or synonyms are implied. An artifactId that writes
+the query words as one word in order (`speechtotext`, `httpclient5`) gets a name signal. Beyond two keyword-only
+matches from the same groupId, further ones are demoted (not removed), because modules of one project often share
+the parent's description (16 factoryfx and 22 HK2 modules matched `dependency injection`).
+
+What the index cannot support: it exposes no download, usage or dependents counts, so ranking cannot reflect
+popularity, and version count is not used as a proxy for it. Libraries whose descriptions use other words are not
+found (Apache HttpClient: "Apache HttpComponents Client"; Dagger: "dependency injector"; Liquibase: "database
+changes"), and keyword matches beyond the index's own top 100 are not re-ranked (OkHttp for `HTTP client`, Guice for
+`dependency injection`). Words are matched literally: synonyms are not
+expanded, so a client should also try related phrasings (the response suggests this when there are fewer results than
+`limit`). Keywords exist only for artifacts the (stale) search index knows, and come from the indexed version's
+description. Search expressions (`g:…`) and `groupId:artifactId` lookups use name search only. A single dotted
+token is a groupId query only if the index actually has artifacts in that group or a subgroup (one extra count query,
+e.g. `net.sf.json-lib`, `edu.illinois`, `gov.nasa.pds`, `io.ktor`); otherwise (`speech.to.text`, `node.js`,
+`spring.boot`) it is searched as words. If that check fails, the query is searched as words and a note says so. An
+explicit `groupId` filter combined with plain words restricts both name and keyword matches to that group.
+
 ### Search ranking
 
 The search index orders by its own text score, so forks and repackages often come first (it lists a WSO2 repackage
 of `okhttp` above `com.squareup.okhttp3:okhttp`). For plain-word queries the plugin re-ranks the top 100 index
 matches by: exact groupId match (for groupId-shaped queries), exact artifactId match (query words joined with `-`),
-artifactId prefix/term match, a non-generic query word in the groupId (`com`, `org`, `io`, … are ignored), number of
-published versions (capped), recency, then index order. Each result lists these facts in `rankingSignals`. Ranking
+artifactId prefix/phrase/term match, a non-generic query word in the groupId (`com`, `org`, `io`, … are ignored),
+description keywords, number of published versions (capped), recency, then index order. Each result lists these facts in `rankingSignals`. Ranking
 never labels an artifact "official"; the notes tell the client to confirm the groupId.
 
 - **groupId-shaped queries** (`com.fasterxml.jackson.core`): artifacts in exactly that group rank first, then its
@@ -113,6 +159,16 @@ Connection errors and HTTP 502/503/504 are retried once; timeouts and HTTP 429 a
   search expressions and index-ordered positions; every result now has `provenance` for `name`, `description` and
   `relocatedTo`.
 - All tools: POM provenance sources changed from `pom <g:a:v>` to `pom:<g:a:v>` (and `parent-pom:<g:a:v>`).
+- `search_artifacts`: added `nameMatchCount`, `descriptionKeywordMatchCount` and `descriptionKeywordMatching`;
+  "artifactId contains all query terms" now compares whole tokens (previously substrings).
+- `search_artifacts`: plain-word queries also return description-keyword matches (with their own signal), so
+  `totalCount` can be larger than before; added the signal `artifactId contains the query phrase` for multi-word
+  queries.
+- `get_artifact_info`: added `releaseVariants` (platform variants of the latest stable release, e.g. Guava
+  `33.8.0-jre` and `33.8.0-android`; absent when there is one form) and clearer notes on `scmUrl` versus
+  `parentScmUrl`.
+- All tools: timestamps always have three fraction digits (`2026-11-02T18:06:39.000Z`); previously whole-second values
+  omitted them. Values and provenance are unchanged.
 - `get_artifact_info`: `projectUrl`/`scmUrl` provenance is `not_computed` (previously `missing`) when only a parent
   POM declares the value; added `pom.parentProjectUrl` and `pom.parentScmUrl`.
 - `get_artifact_info`: added `pom.licenseDetails` (`name` and `url` per license, as declared); `pom.licenses` is

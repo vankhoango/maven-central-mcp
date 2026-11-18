@@ -68,6 +68,19 @@ data class SearchResultPage(
     /** How results are ordered (local relevance ranking or upstream order). */
     val ranking: String,
     val results: List<ArtifactSummary>,
+    /** Matches found by name (artifactId/groupId tokens). For name-only searches this equals totalCount. */
+    val nameMatchCount: Long? = null,
+    /**
+     * Matches found only through description keywords; included in totalCount. Null unless
+     * [descriptionKeywordMatching] is `applied`.
+     */
+    val descriptionKeywordMatchCount: Long? = null,
+    /**
+     * Whether description-keyword (feature) matching contributed: `applied`; `unavailable` (the keyword query
+     * failed, so totalCount covers name matches only); `no_meaningful_words` (only grammatical words or
+     * punctuation); `not_applicable` (search expressions, `groupId:artifactId` lookups, reverse-domain groupIds).
+     */
+    val descriptionKeywordMatching: String = "not_applicable",
     val notes: List<String> = emptyList(),
 )
 
@@ -185,6 +198,12 @@ data class ArtifactInfo(
     val repositoryLastUpdated: String?,
     val versionCount: Int?,
     val pom: PomMetadata?,
+    /**
+     * Platform variants of the latest stable release (e.g. `33.8.0-jre`, `33.8.0-android` for Guava), first the one
+     * whose POM was read. Null when that release exists in one form only. Uses the same variant detection as
+     * get_latest_version, whose `variants` field lists the latest version of every variant.
+     */
+    val releaseVariants: List<String>? = null,
     val links: Map<String, String>,
     /** Per-field source/status for the top-level fields (see [Provenance]). */
     val provenance: Map<String, Provenance> = emptyMap(),

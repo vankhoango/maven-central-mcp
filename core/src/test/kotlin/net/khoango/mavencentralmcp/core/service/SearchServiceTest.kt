@@ -49,7 +49,8 @@ class SearchServiceTest {
         assertTrue(page.results.first().rankingSignals.contains("artifactId exactly matches the query"))
         assertTrue(page.ranking.contains("does not verify the publisher"))
         assertTrue(page.notes.any { "Several publishers" in it })
-        assertTrue(page.notes.any { "top 100 of 593" in it })
+        // The fixture claims 593 matches but returns 3 documents: the note reports the pool actually re-ranked.
+        assertTrue(page.notes.any { "top 3 of 593 matches are re-ranked" in it })
         assertEquals("100", fetcher.requests.first { it.host == "search.maven.org" }.param("rows"))
     }
 
@@ -156,7 +157,14 @@ class SearchServiceTest {
 
     @Test
     fun `deep pages beyond the re-ranked pool use index order`() = runTest {
-        val (svc, fetcher) = setup { uri -> if (uri.host == "search.maven.org") ok(okhttpPool) else status(404) }
+        val deepPage = solr(593, doc("org.deep", "okhttp-deep", 1))
+        val (svc, fetcher) = setup { uri ->
+            when {
+                uri.host != "search.maven.org" -> status(404)
+                uri.param("start") == "0" -> ok(okhttpPool)
+                else -> ok(deepPage) // positions past the pool are different documents
+            }
+        }
         val page = svc.search(SearchRequest("okhttp", limit = 10, offset = 150, includeDescriptions = false))
         assertEquals(listOf("0", "150"), fetcher.requests.map { it.param("start") })
         assertTrue(page.ranking.startsWith("Maven Central search index order"))

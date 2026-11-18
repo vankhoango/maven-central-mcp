@@ -60,8 +60,14 @@ class MavenCentralTools(private val service: MavenCentralService) {
         name = SEARCH_ARTIFACTS,
         title = "Search Maven Central artifacts",
         description = """
-            Search Maven Central for artifacts. Free-text terms (e.g. 'jackson databind', 'okhttp') match groupId and
-            artifactId tokens, not descriptions, and the top 100 matches are re-ranked locally: for a groupId-shaped
+            Search Maven Central for artifacts by name or by feature. Plain words (e.g. 'jackson databind', 'okhttp',
+            'speech recognition') match groupId/artifactId tokens and also description keywords: the search index's
+            keywords derived from each POM description, so feature searches find libraries whose names do not contain
+            the words (marked by a 'description keywords contain all query terms' signal). Every word must match;
+            words are matched literally, so for features also try synonyms (e.g. 'speech-to-text', 'transcription').
+            'nameMatchCount' and 'descriptionKeywordMatchCount' split totalCount; 'descriptionKeywordMatching' is
+            applied, unavailable (keyword query failed: name matches only), no_meaningful_words or not_applicable.
+            Up to 100 name matches plus 100 description-keyword matches are re-ranked locally: for a groupId-shaped
             query (e.g. 'com.fasterxml.jackson.core') artifacts in exactly that group come first; otherwise exact
             artifactId match first, then a query term in the groupId, number of published versions and recency.
             Every result lists its 'rankingSignals' (index-ordered results state their index position).
@@ -79,7 +85,7 @@ class MavenCentralTools(private val service: MavenCentralService) {
         """.trimIndent(),
         inputSchema = schema(
             required = listOf("query"),
-            "query" to stringProp("Search words ('okhttp', 'jackson databind'), an exact 'groupId:artifactId', or a search expression ('g:io.ktor AND a:ktor-server*'). Max ${ArgumentValidator.MAX_QUERY_LENGTH} chars."),
+            "query" to stringProp("Search words naming an artifact or a feature ('okhttp', 'jackson databind', 'speech recognition'), an exact 'groupId:artifactId', or a search expression ('g:io.ktor AND a:ktor-server*'). Max ${ArgumentValidator.MAX_QUERY_LENGTH} chars."),
             "groupId" to stringProp("Optional exact groupId filter, e.g. 'com.squareup.okhttp3'."),
             "artifactId" to stringProp("Optional exact artifactId filter, e.g. 'okhttp'."),
             "packaging" to stringProp("Optional packaging filter, e.g. 'jar', 'aar', 'pom', 'bundle'."),
@@ -128,7 +134,10 @@ class MavenCentralTools(private val service: MavenCentralService) {
             not_computed (only a parent POM declares projectUrl/scmUrl; its own value is in parentProjectUrl/parentScmUrl,
             but the artifact's derived URL is not computed).
             'packaging' comes from the POM (Maven's 'jar' default when undeclared, labelled maven-default);
-            'indexedPackaging' is the search index's value. Returns an error result if the artifact does not exist.
+            'indexedPackaging' is the search index's value. 'releaseVariants' lists the platform variants of the latest
+            stable release (e.g. 33.8.0-jre, 33.8.0-android), the described one first; it is absent when that release
+            has a single form. Timestamps are ISO-8601 UTC with millisecond precision ('.000' for second-precision
+            sources). Returns an error result if the artifact does not exist.
             The 'indexedLatestVersion', 'repositoryLatestVersion' and 'repositoryReleaseVersion' fields are raw
             repository markers and are NOT guaranteed to be stable; use get_latest_version for that.
         """.trimIndent(),

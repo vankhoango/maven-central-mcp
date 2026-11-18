@@ -38,9 +38,9 @@ class PublicationDatesTest {
         }
         val page = MavenCentralService(MavenCentralClient(fetcher)).getVersions(lib, 10, 0, true)
         val byVersion = page.versions.associateBy { it.version }
-        assertEquals("2026-11-02T18:06:39Z", byVersion.getValue("2.0").published)
+        assertEquals("2026-11-02T18:06:39.000Z", byVersion.getValue("2.0").published)
         assertEquals(Provenance.present(Provenance.FILE_TIMESTAMP), byVersion.getValue("2.0").publishedProvenance)
-        assertEquals("2020-09-13T12:26:40Z", byVersion.getValue("1.0").published)
+        assertEquals("2020-09-13T12:26:40.000Z", byVersion.getValue("1.0").published)
         assertEquals(Provenance.present(Provenance.SEARCH_INDEX), byVersion.getValue("1.0").publishedProvenance)
         // Only the version missing from the index needed a HEAD request.
         assertEquals(1, fetcher.headRequests.size)
@@ -86,7 +86,7 @@ class PublicationDatesTest {
             }
         }
         val page = MavenCentralService(MavenCentralClient(fetcher)).getVersions(lib, 10, 0, true)
-        assertEquals("2017-07-14T02:40:00Z", page.versions.single { it.version == "0.1" }.published)
+        assertEquals("2017-07-14T02:40:00.000Z", page.versions.single { it.version == "0.1" }.published)
         assertEquals(listOf("0", "200"), fetcher.requests.filter { it.host == "search.maven.org" }.map { it.param("start") })
         assertTrue(fetcher.headRequests.isEmpty())
     }
@@ -97,7 +97,7 @@ class PublicationDatesTest {
             if (uri.host == "repo1.maven.org") ok(metadataXml(listOf("1.0", "2.0-RC1"))) else ok(gav("1.0" to 1_600_000_000_000))
         }
         val r = MavenCentralService(MavenCentralClient(fetcher)).getLatestVersion(lib, false)
-        assertEquals("2026-11-02T18:06:39Z", r.latestPublishedTimestamp)
+        assertEquals("2026-11-02T18:06:39.000Z", r.latestPublishedTimestamp)
         assertEquals(Provenance.FILE_TIMESTAMP, r.timestampProvenance.getValue("latestPublishedTimestamp").source)
         assertEquals(Provenance.SEARCH_INDEX, r.timestampProvenance.getValue("latestStableTimestamp").source)
     }

@@ -25,6 +25,9 @@ object TestSupport {
             )
             path.endsWith(".pom") && path.startsWith("/maven2/com/example/lib/") ->
                 ok("<project><name>Example Lib</name><description>An example.</description></project>")
+            // Description-keyword (tags:) searches find nothing extra in this fixture.
+            uri.host == "search.maven.org" && uri.rawQuery.contains("tags%3A") ->
+                ok("""{"response":{"numFound":0,"start":0,"docs":[]}}""")
             uri.host == "search.maven.org" && uri.rawQuery.contains("core=gav") ->
                 ok("""{"response":{"numFound":1,"docs":[{"g":"com.example","a":"lib","v":"1.10","timestamp":1600000000000}]}}""")
             uri.host == "search.maven.org" -> ok(

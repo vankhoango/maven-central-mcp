@@ -43,7 +43,7 @@ class MavenCentralServiceTest {
         assertEquals("com.other:lib-extra", "${hit.groupId}:${hit.artifactId}") // second after re-ranking
         assertEquals(2, hit.rank)
         assertEquals("https://central.sonatype.com/artifact/com.other/lib-extra", hit.url)
-        assertEquals("2023-11-14T22:13:20Z", hit.lastUpdated)
+        assertEquals("2023-11-14T22:13:20.000Z", hit.lastUpdated)
         assertTrue(page.hasMore)
     }
 
@@ -64,8 +64,8 @@ class MavenCentralServiceTest {
         val r = svc.getLatestVersion(lib, includeSnapshots = false)
         assertEquals("2.0-RC1", r.latestPublishedVersion)
         assertEquals("1.10", r.latestStableVersion)
-        assertEquals("2023-11-14T22:13:20Z", r.latestPublishedTimestamp)
-        assertEquals("2020-09-13T12:26:40Z", r.latestStableTimestamp)
+        assertEquals("2023-11-14T22:13:20.000Z", r.latestPublishedTimestamp)
+        assertEquals("2020-09-13T12:26:40.000Z", r.latestStableTimestamp)
         assertEquals(4, r.versionCount)
         assertFalse(r.uncertain)
         assertTrue(r.policy.contains("ComparableVersion"))
@@ -133,7 +133,7 @@ class MavenCentralServiceTest {
         assertTrue(all.versions[0].prerelease)
         assertEquals(5, all.totalCount)
         assertTrue(all.hasMore)
-        assertEquals("2020-09-13T12:26:40Z", all.versions[1].published)
+        assertEquals("2020-09-13T12:26:40.000Z", all.versions[1].published)
 
         val stable = svc.getVersions(lib, limit = 10, offset = 1, includePrereleases = false)
         assertEquals(listOf("1.9", "1.2", "1.0"), stable.versions.map { it.version })
@@ -171,7 +171,7 @@ class MavenCentralServiceTest {
         assertEquals("1.0", info.pom?.version) // POM of the latest stable version
         assertEquals("Does things", info.pom?.description)
         assertEquals(2, info.versionCount)
-        assertEquals("2026-11-02T18:07:48Z", info.repositoryLastUpdated)
+        assertEquals("2026-11-02T18:07:48.000Z", info.repositoryLastUpdated)
         assertTrue(info.notes.any { "lag" in it })
     }
 

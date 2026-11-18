@@ -60,10 +60,20 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
         }
         val groupId = coordinate?.groupId ?: request.groupId
         val artifactId = coordinate?.artifactId ?: request.artifactId
+        // Trailing sentence punctuation ('json parser!') is not part of the search; '!'/'?' would otherwise be operators.
+        val query = if (coordinate == null) SearchRanking.normalize(request.query) else request.query
+        if (query != request.query.trim()) notes += "Trailing punctuation was ignored; searched for '$query'."
+        if (coordinate == null) {
+            SearchRanking.wordsWithDroppedSymbols(query).takeIf { it.isNotEmpty() }?.let { words ->
+                notes += "The search index ignores symbols such as + and #, so ${words.joinToString { "'$it'" }} " +
+                    "matched only the letters and digits (e.g. 'c++' and 'c#' both match 'c'). Results may not reflect " +
+                    "the intended meaning; consider spelling it out (e.g. 'cpp', 'csharp')."
+            }
+        }
         val solrQuery = MavenCentralClient.buildSearchQuery(
-            if (coordinate != null) null else request.query, groupId, artifactId, request.packaging,
+            if (coordinate != null) null else query, groupId, artifactId, request.packaging,
         )
-        val terms = if (coordinate == null) SearchRanking.terms(request.query) else null
+        val terms = if (coordinate == null) SearchRanking.terms(query) else null
         val offset = request.offset
         val limit = request.limit
         val pageEnd = offset + limit
@@ -72,26 +82,104 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
         var total: Long
         var reranked = 0
         var indexOrdered = 0
+        var keywordTotal = 0L
+        var keywordOnPage = 0
+        var poolBoundary = SearchRanking.POOL_SIZE
+        var nameMatchCount: Long? = null
+        var keywordMatching = KEYWORDS_NOT_APPLICABLE
         if (terms != null) {
-            // Re-ranked part: positions [offset, min(pageEnd, POOL_SIZE)) of the locally ranked top-100 pool.
-            val pool = client.searchArtifacts(solrQuery, rows = SearchRanking.POOL_SIZE, start = 0)
-            total = pool.numFound ?: pool.docs.orEmpty().size.toLong()
-            val candidates = candidatesOf(pool.docs.orEmpty(), firstPosition = 0)
+            // Two disjoint result sets: name matches (the search index's own query) and description-keyword-only
+            // matches (see SearchRanking.keywordQuery). Each contributes its top POOL_SIZE to one re-ranked pool.
+            val groupLookup = isExistingGroup(query, notes)
+            val keywordExpression = if (groupLookup) null else SearchRanking.keywordQuery(query)
+            when {
+                groupLookup -> notes += "'$query' is a groupId in the search index (it or its subgroups have artifacts), " +
+                    "so it was searched by name only, without description-keyword matching."
+                keywordExpression == null -> {
+                    keywordMatching = KEYWORDS_NO_TERMS
+                    notes += "Description-keyword matching was not applied: after removing grammatical words and " +
+                        "punctuation, the query has no meaningful word. Only name matches are returned."
+                }
+                else -> keywordMatching = KEYWORDS_APPLIED
+            }
+            val keywordSolr = keywordExpression?.let { MavenCentralClient.buildSearchQuery(it, groupId, artifactId, request.packaging) }
+            val (namePool, keywordPool) = coroutineScope {
+                val keyword = keywordSolr?.let { q ->
+                    async {
+                        try {
+                            client.searchArtifacts(q, rows = SearchRanking.POOL_SIZE, start = 0)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: MavenCentralException) {
+                            keywordMatching = KEYWORDS_UNAVAILABLE
+                            notes += "Description-keyword matching failed and was skipped (${e.message}); totalCount and " +
+                                "results include name matches only. Retry later for feature-search results."
+                            null
+                        }
+                    }
+                }
+                client.searchArtifacts(solrQuery, rows = SearchRanking.POOL_SIZE, start = 0) to keyword?.await()
+            }
+            val nameDocs = namePool.docs.orEmpty()
+            val keywordDocs = keywordPool?.docs.orEmpty()
+            val nameTotal = namePool.numFound ?: nameDocs.size.toLong()
+            keywordTotal = keywordPool?.numFound ?: keywordDocs.size.toLong()
+            total = nameTotal + keywordTotal
+            nameMatchCount = nameTotal
+
+            val nameCandidates = candidatesOf(nameDocs, firstPosition = 0)
+            val nameKeys = nameCandidates.map { it.second.key() }.toSet()
+            val allKeywordCandidates = candidatesOf(keywordDocs, firstPosition = nameDocs.size)
+            val keywordCandidates = allKeywordCandidates.filter { it.second.key() !in nameKeys } // disjoint by construction
+            val overlap = allKeywordCandidates.size - keywordCandidates.size
+            if (overlap > 0) {
+                keywordTotal -= overlap
+                total -= overlap
+            }
+            val keywordKeys = keywordCandidates.map { it.second.key() }.toSet()
+            val candidates = nameCandidates + keywordCandidates
+            val poolSize = candidates.size
             val docByCandidate = candidates.associate { it.second to it.first }
-            if (offset < SearchRanking.POOL_SIZE) {
-                SearchRanking.rank(terms, candidates.map { it.second }, SearchRanking.groupQuery(request.query))
+            if (offset < poolSize) {
+                SearchRanking.rank(
+                    terms, candidates.map { it.second }, SearchRanking.groupQuery(query), keywordKeys,
+                    phrase = SearchRanking.isPhraseQuery(query),
+                )
                     .drop(offset).take(limit)
                     .forEach { ordered += docByCandidate.getValue(it.candidate) to it.signals }
                 reranked = ordered.size
             }
-            // Index-ordered part: positions >= POOL_SIZE, fetched only if they exist.
-            val upstreamStart = maxOf(offset, SearchRanking.POOL_SIZE)
-            if (pageEnd > SearchRanking.POOL_SIZE && upstreamStart < total) {
-                val rows = minOf(pageEnd - upstreamStart, limit)
-                val deep = client.searchArtifacts(solrQuery, rows = rows, start = upstreamStart)
-                ordered += upstreamOrdered(deep.docs.orEmpty(), upstreamStart, groupId, coordinate != null)
+            keywordOnPage = ordered.count { (doc, _) -> "${doc.g}:${doc.a}" in keywordKeys }
+
+            // Positions past the pool: remaining name matches in index order, then remaining keyword matches.
+            val deepStart = maxOf(offset, poolSize)
+            val deepEnd = minOf(pageEnd.toLong(), total).toInt()
+            if (deepStart < deepEnd) {
+                val nameRemaining = (nameTotal - nameDocs.size).coerceAtLeast(0).toInt()
+                val nameFrom = deepStart - poolSize
+                val nameTo = minOf(deepEnd - poolSize, nameRemaining)
+                // Guard against an index that returns already-pooled documents again (never seen live).
+                val seen = candidates.map { it.second.key() }.toMutableSet()
+                fun List<SolrArtifactDoc>.unseen() = filter { seen.add("${it.g}:${it.a}") }
+                if (nameFrom < nameTo) {
+                    val start = nameDocs.size + nameFrom
+                    val deep = client.searchArtifacts(solrQuery, rows = nameTo - nameFrom, start = start)
+                    ordered += upstreamOrdered(deep.docs.orEmpty().unseen(), deepStart, groupId, coordinateQuery = false)
+                }
+                val kwFrom = maxOf(nameFrom, nameRemaining) - nameRemaining
+                val kwTo = deepEnd - poolSize - nameRemaining
+                if (keywordSolr != null && kwFrom < kwTo) {
+                    val start = keywordDocs.size + kwFrom
+                    val deep = client.searchArtifacts(keywordSolr, rows = kwTo - kwFrom, start = start).docs.orEmpty().unseen()
+                    ordered += upstreamOrdered(
+                        deep, poolSize + nameRemaining + kwFrom, groupId,
+                        coordinateQuery = false, descriptionKeywordMatch = true,
+                    )
+                    keywordOnPage += deep.size
+                }
                 indexOrdered = ordered.size - reranked
             }
+            poolBoundary = poolSize
         } else {
             val page = client.searchArtifacts(solrQuery, rows = limit, start = offset)
             total = page.numFound ?: page.docs.orEmpty().size.toLong()
@@ -116,12 +204,23 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             notes += "offset $offset is at or beyond totalCount $total; there are no results on this page. " +
                 "Use an offset below $total."
         }
-        if (reranked > 0 && total > SearchRanking.POOL_SIZE) {
-            notes += "Only the top ${SearchRanking.POOL_SIZE} of $total index matches are re-ranked. " +
-                "Add words or a groupId/artifactId filter to narrow the search."
+        if (reranked > 0 && total > poolBoundary) {
+            notes += "Only the top $poolBoundary of $total matches are re-ranked (up to ${SearchRanking.POOL_SIZE} name " +
+                "matches and ${SearchRanking.POOL_SIZE} description-keyword matches). Add words or a groupId/artifactId " +
+                "filter to narrow the search."
         }
         if (terms != null && indexOrdered > 0) {
-            notes += "Results from position ${SearchRanking.POOL_SIZE + 1} onward are in search-index order (not re-ranked)."
+            notes += "Results from position ${poolBoundary + 1} onward are in search-index order (not re-ranked): " +
+                "remaining name matches first, then remaining description-keyword matches."
+        }
+        if (keywordTotal > 0) {
+            notes += "$keywordTotal of $total matches were found through description keywords (the search index's tags, " +
+                "derived from POM descriptions), not names" + (if (keywordOnPage > 0) "; $keywordOnPage on this page" else "") +
+                ". They carry the signal '${SearchRanking.DESCRIPTION_KEYWORD_SIGNAL}'."
+        }
+        if (keywordMatching == KEYWORDS_APPLIED && total < limit) {
+            notes += "Words are matched literally against names and description keywords. For a feature search, also " +
+                "try synonyms or related terms (for example 'speech recognition', 'speech-to-text', 'transcription')."
         }
         val sharedArtifactIds = results.groupBy { it.artifactId }.filterValues { hits -> hits.map { it.groupId }.distinct().size > 1 }
         if (sharedArtifactIds.isNotEmpty()) {
@@ -154,8 +253,29 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
                 else -> SearchRanking.UPSTREAM_DESCRIPTION
             },
             results = results,
+            nameMatchCount = nameMatchCount ?: total,
+            descriptionKeywordMatchCount = if (keywordMatching == KEYWORDS_APPLIED) keywordTotal else null,
+            descriptionKeywordMatching = keywordMatching,
             notes = notes,
         )
+    }
+
+    /**
+     * True if [query] is a single dotted token (e.g. `net.sf.json-lib`, `edu.illinois`, `io.ktor`) for which the
+     * search index has artifacts in that group or a subgroup. Natural-language dotted queries (`speech.to.text`,
+     * `node.js`) have none and are searched as words. If the check itself fails, the query is treated as words and
+     * a note says the classification could not be verified.
+     */
+    private suspend fun isExistingGroup(query: String, notes: MutableList<String>): Boolean {
+        val group = SearchRanking.groupQuery(query) ?: return false
+        return try {
+            (client.searchArtifacts(SearchRanking.groupExistsQuery(group), rows = 0, start = 0).numFound ?: 0) > 0
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: MavenCentralException) {
+            notes += "Could not check whether '$query' is a groupId (${e.message}); it was searched as words."
+            false
+        }
     }
 
     private fun candidatesOf(docs: List<SolrArtifactDoc>, firstPosition: Int) = docs.mapIndexedNotNull { i, doc ->
@@ -165,11 +285,20 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
     }
 
     /** Index-ordered results with factual signals; [start] is the 0-based index position of the first doc. */
-    private fun upstreamOrdered(docs: List<SolrArtifactDoc>, start: Int, groupFilter: String?, coordinateQuery: Boolean) =
-        candidatesOf(docs, start).let { candidates ->
-            val newest = candidates.mapNotNull { it.second.timestamp }.maxOrNull()
-            candidates.map { (doc, c) -> doc to SearchRanking.upstreamSignals(c, c.upstreamPosition + 1, newest, groupFilter, coordinateQuery) }
+    private fun upstreamOrdered(
+        docs: List<SolrArtifactDoc>,
+        start: Int,
+        groupFilter: String?,
+        coordinateQuery: Boolean,
+        descriptionKeywordMatch: Boolean = false,
+    ) = candidatesOf(docs, start).let { candidates ->
+        val newest = candidates.mapNotNull { it.second.timestamp }.maxOrNull()
+        candidates.map { (doc, c) ->
+            doc to SearchRanking.upstreamSignals(c, c.upstreamPosition + 1, newest, groupFilter, coordinateQuery, descriptionKeywordMatch)
         }
+    }
+
+    private fun SearchRanking.Candidate.key() = "$groupId:$artifactId"
 
     /**
      * Loads POM name/description/relocation for the first [DESCRIPTION_LIMIT] results of the page concurrently.
@@ -295,7 +424,11 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
         }
 
         val versions = metadata?.versions.orEmpty()
-        val stable = VersionPolicy.pickNewest(versions.filterNot(VersionPolicy::isPrerelease)).version
+        val stablePick = VersionPolicy.pickNewest(versions.filterNot(VersionPolicy::isPrerelease))
+        val stable = stablePick.version
+        // Same release published as several platform variants (Guava 33.8.0-jre / 33.8.0-android). Derived from the
+        // version list already loaded, with the same detection get_latest_version uses; null when there are none.
+        val releaseVariants = stable?.takeIf { stablePick.competing.isNotEmpty() }?.let { listOf(it) + stablePick.competing }
         val pomVersion = stable ?: metadata?.release ?: metadata?.latest ?: doc?.latestVersion
         var pomFailure: String? = null
         val pom: PomMetadata? = pomVersion?.let { v ->
@@ -356,12 +489,25 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
         }
         if (pom != null) {
             notes += "POM fields describe version ${pom.version}. description, licenses, developers and organization " +
-                "follow Maven inheritance through up to ${PomResolver.INFO_MAX_PARENTS} parent POMs; name, packaging, " +
-                "projectUrl and scmUrl are read from the artifact's own POM only. See pom.provenance."
+                "follow Maven inheritance through up to ${PomResolver.INFO_MAX_PARENTS} parent POMs; name and packaging " +
+                "come from the artifact's own POM. projectUrl and scmUrl are the artifact's own POM values; when its POM " +
+                "has none, the nearest parent POM's declared value is returned separately as parentProjectUrl / " +
+                "parentScmUrl (Maven would derive the artifact's URL from it by appending the module path, which is not " +
+                "reproduced). See pom.provenance."
+            if (pom.scmUrl == null && pom.parentScmUrl != null) {
+                notes += "scmUrl is null because the artifact's own POM declares no <scm>; SCM information is still " +
+                    "available from parent POM ${pom.provenance["scmUrl"]?.source?.removePrefix("parent-pom:")}: " +
+                    "parentScmUrl = ${pom.parentScmUrl}."
+            }
             if (pom.provenance.values.any { it.status == Provenance.UNRESOLVED }) {
                 notes += "Some POM values contain \${...} property expressions, which are not evaluated (status unresolved)."
             }
             notes += "Developer e-mail addresses are not returned."
+        }
+        if (releaseVariants != null) {
+            notes += "The latest stable release is published in several platform variants " +
+                "(${releaseVariants.joinToString()}); POM fields describe $pomVersion. Choose the variant for the " +
+                "target platform; get_latest_version lists the latest version of every variant."
         }
         notes += "indexedLatestVersion and repositoryReleaseVersion are not guaranteed to be stable versions; use get_latest_version."
 
@@ -377,6 +523,7 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             repositoryLastUpdated = metadata?.lastUpdated?.let(::formatMetadataTimestamp),
             versionCount = metadata?.versions?.size ?: doc?.versionCount,
             pom = pom,
+            releaseVariants = releaseVariants,
             links = links(coordinates),
             provenance = provenance,
             notes = notes,
@@ -583,6 +730,18 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
                 "already uses unless upgrading deliberately (see stableLines); respect versions managed by a BOM or " +
                 "platform (Spring Boot, Kotlin, AndroidX); prefer latestStableVersion over prereleases unless asked."
 
+        /** `descriptionKeywordMatching` values: keyword matches were searched and are included in totalCount. */
+        const val KEYWORDS_APPLIED = "applied"
+
+        /** The keyword query failed; totalCount and results contain name matches only. */
+        const val KEYWORDS_UNAVAILABLE = "unavailable"
+
+        /** The query has no meaningful word after removing grammatical words and punctuation. */
+        const val KEYWORDS_NO_TERMS = "no_meaningful_words"
+
+        /** Search expressions, `groupId:artifactId` lookups and reverse-domain groupId queries use name search only. */
+        const val KEYWORDS_NOT_APPLICABLE = "not_applicable"
+
         /** Parent POM levels search reads, only when a result's own POM has no description. */
         const val SEARCH_MAX_PARENTS = 2
 
@@ -610,13 +769,21 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             "repositoryDirectory" to "${MavenCentralClient.REPOSITORY_URL}/${MavenCentralClient.artifactPath(c)}/",
         )
 
-        internal fun formatEpochMillis(millis: Long): String = Instant.ofEpochMilli(millis).toString()
+        /**
+         * One timestamp format for every source: ISO-8601 UTC with exactly three fraction digits. All sources are
+         * at most millisecond-precise (search index: milliseconds; POM `Last-Modified` and maven-metadata
+         * `lastUpdated`: whole seconds), so nothing is discarded; whole-second values show `.000`. Which source a
+         * timestamp came from is stated by its provenance, not by its format.
+         */
+        private val ISO_UTC_MILLIS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)
+
+        internal fun formatEpochMillis(millis: Long): String = ISO_UTC_MILLIS.format(Instant.ofEpochMilli(millis))
 
         private val METADATA_TS = DateTimeFormatter.ofPattern("yyyyMMddHHmmss")
 
         /** Converts maven-metadata `lastUpdated` (yyyyMMddHHmmss, UTC) to ISO-8601; returns raw on failure. */
         internal fun formatMetadataTimestamp(raw: String): String = try {
-            LocalDateTime.parse(raw, METADATA_TS).toInstant(ZoneOffset.UTC).toString()
+            ISO_UTC_MILLIS.format(LocalDateTime.parse(raw, METADATA_TS).toInstant(ZoneOffset.UTC))
         } catch (_: Exception) {
             raw
         }
