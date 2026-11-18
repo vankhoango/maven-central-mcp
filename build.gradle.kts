@@ -93,6 +93,24 @@ intellijPlatform {
             }
         }
     }
+
+    // Release secrets come only from environment variables; never commit them.
+    // See https://plugins.jetbrains.com/docs/intellij/plugin-signing.html
+    signing {
+        // PEM-encoded certificate chain and private key (the file contents, not paths).
+        certificateChain = providers.environmentVariable("CERTIFICATE_CHAIN")
+        privateKey = providers.environmentVariable("PRIVATE_KEY")
+        password = providers.environmentVariable("PRIVATE_KEY_PASSWORD")
+    }
+
+    // `./gradlew publishPlugin` uploads to JetBrains Marketplace. The first version of a
+    // plugin must be uploaded manually on plugins.jetbrains.com before this task can be used.
+    publishing {
+        // Permanent token from plugins.jetbrains.com > My Tokens.
+        token = providers.environmentVariable("PUBLISH_TOKEN")
+        // Release channel; defaults to the stable channel ("default").
+        channels = providers.environmentVariable("PUBLISH_CHANNEL").map { listOf(it) }.orElse(listOf("default"))
+    }
 }
 
 tasks.test {
