@@ -16,10 +16,15 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.response.respondText
 import io.modelcontextprotocol.kotlin.sdk.server.mcpStreamableHttp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import java.net.BindException
+import java.util.logging.Logger
 
 /**
  * Embedded MCP Streamable HTTP server bound to the IPv4 loopback interface only.
@@ -44,6 +49,19 @@ class EmbeddedMcpHttpServer(
 
     private var server: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
 
+    /**
+     * Receives failures of the engine's own coroutines, which have no parent to report to. Without it, a bind
+     * failure on an occupied port, which [start] already reports as [ServerStartException], also reached the
+     * global coroutine handler, and IntelliJ logs that as an unhandled plugin error.
+     */
+    private val engineExceptionHandler = CoroutineExceptionHandler { _, e ->
+        if (generateSequence(e) { it.cause }.any { it is BindException }) {
+            log.fine { "Embedded MCP server engine stopped: port $port is in use (reported by start())" }
+        } else {
+            log.warning("Embedded MCP server engine failed on port $port: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
     /** The URL clients should connect to. */
     val endpointUrl: String get() = "http://$LOOPBACK_HOST:$port$path"
 
@@ -54,7 +72,16 @@ class EmbeddedMcpHttpServer(
      */
     suspend fun start() {
         check(server == null) { "Server already started" }
-        val created = embeddedServer(CIO, port = port, host = LOOPBACK_HOST) { configure() }
+        SdkLogFilter.install()
+        // Same scope as the plain embeddedServer(...) overload (GlobalScope), plus a handler for the engine's
+        // own coroutines; see engineExceptionHandler.
+        @OptIn(DelicateCoroutinesApi::class)
+        val created = GlobalScope.embeddedServer(
+            CIO,
+            port = port,
+            host = LOOPBACK_HOST,
+            parentCoroutineContext = engineExceptionHandler,
+        ) { configure() }
         try {
             created.startSuspend(wait = false)
         } catch (e: Throwable) {
@@ -118,6 +145,8 @@ class EmbeddedMcpHttpServer(
         const val LOOPBACK_HOST = "127.0.0.1"
         const val DEFAULT_PATH = "/mcp"
         const val MAX_REQUEST_BYTES = 1L * 1024 * 1024
+
+        private val log: Logger = Logger.getLogger(EmbeddedMcpHttpServer::class.java.name)
 
         /** Host header values accepted for [port] (lower-case). */
         fun allowedHostHeaders(port: Int): List<String> = listOf("127.0.0.1:$port", "localhost:$port", "[::1]:$port")
