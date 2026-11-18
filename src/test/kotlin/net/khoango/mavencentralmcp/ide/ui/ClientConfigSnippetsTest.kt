@@ -10,8 +10,8 @@ import org.junit.jupiter.api.Test
 class ClientConfigSnippetsTest {
     @Test
     fun `mcpServers snippet is valid json with loopback url`() {
-        val url = ClientConfigSnippets.endpointUrl(47115)
-        assertEquals("http://127.0.0.1:47115/mcp", url)
+        val url = ClientConfigSnippets.endpointUrl(9909)
+        assertEquals("http://127.0.0.1:9909/mcp", url)
         val server = Json.parseToJsonElement(ClientConfigSnippets.mcpServersJson(url))
             .jsonObject["mcpServers"]!!.jsonObject["maven-central"]!!.jsonObject
         assertEquals("http", server["type"]!!.jsonPrimitive.content)

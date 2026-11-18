@@ -117,7 +117,7 @@ Exit criteria:
 
 ## Step 7 — Release readiness
 
-Status: Partly done: CI workflow and plugin verification. Pending: license confirmation, Marketplace listing, screenshots.
+Status: Partly done: CI workflow, plugin verification, Apache-2.0 license, Marketplace metadata in `plugin.xml`. Pending: Marketplace listing, screenshots.
 
 Deliverables:
 - CI workflow.

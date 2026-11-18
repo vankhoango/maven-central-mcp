@@ -13,7 +13,7 @@ The plugin is intended for developers using IntelliJ IDEA and Android Studio. It
 - Let an AI client distinguish the newest published version from the newest stable version.
 - Make setup understandable to developers without requiring them to run a separate hosted service.
 - Keep the implementation small, secure, testable, and maintainable.
-- Publish the source code under Apache-2.0 (subject to final maintainer confirmation) and distribute the plugin through JetBrains Marketplace.
+- Publish the source code under Apache-2.0 and distribute the plugin through JetBrains Marketplace.
 
 ## 3. Non-goals for the first release
 

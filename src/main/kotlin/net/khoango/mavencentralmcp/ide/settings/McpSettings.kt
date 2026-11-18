@@ -36,7 +36,7 @@ class McpSettings : SimplePersistentStateComponent<McpSettings.SettingsState>(Se
         }
 
     companion object {
-        const val DEFAULT_PORT = 47115
+        const val DEFAULT_PORT = 9909
         const val MIN_PORT = 1024
         const val MAX_PORT = 65535
 

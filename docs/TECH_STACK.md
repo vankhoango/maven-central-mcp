@@ -114,7 +114,7 @@ Pin test dependencies as well.
 
 - Source hosting: GitHub.
 - Plugin distribution: JetBrains Marketplace.
-- License target: Apache-2.0, pending repository owner confirmation.
+- License: Apache-2.0 (confirmed by the repository owner; see `LICENSE`).
 - No paid hosting or external runtime dependency.
 - Include third-party license notices if required by included libraries.
 

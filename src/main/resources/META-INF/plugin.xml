@@ -1,20 +1,44 @@
 <idea-plugin>
     <id>net.khoango.mavencentralmcp</id>
     <name>Maven Central MCP</name>
-    <vendor>Khoa Ngo</vendor>
+    <vendor url="https://github.com/vankhoango/maven-central-mcp">Khoa Ngo</vendor>
 
     <description><![CDATA[
-    Runs a local <a href="https://modelcontextprotocol.io">Model Context Protocol</a> server inside the IDE so that
-    MCP clients (for example Cursor, Claude Code or VS Code) can search Maven Central and inspect artifact versions.
+    <p><b>Find the right Maven dependencies faster, with less AI context overhead.</b></p>
+    <p>Runs a local <a href="https://modelcontextprotocol.io">Model Context Protocol (MCP)</a> server inside the IDE,
+    giving AI coding assistants such as Claude Code, Cursor or VS Code direct access to Maven Central. Search
+    libraries, inspect dependency metadata and discover versions without lengthy web searches or browsing POM files.</p>
+    <h3>Features</h3>
     <ul>
-      <li><b>search_artifacts</b> &ndash; find artifacts by name, with pagination</li>
-      <li><b>get_artifact_info</b> &ndash; metadata for one exact coordinate</li>
-      <li><b>get_latest_version</b> &ndash; newest published vs. newest stable version, using Maven version ordering</li>
-      <li><b>get_versions</b> &ndash; paginated version list with prerelease flags</li>
+      <li><b>Artifact search</b> &ndash; find libraries by artifact name, group ID or description keywords</li>
+      <li><b>Feature-based discovery</b> &ndash; search by functionality, such as speech recognition or database migration</li>
+      <li><b>Dependency metadata</b> &ndash; descriptions, licenses, developers, SCM information and more</li>
+      <li><b>Version discovery</b> &ndash; latest stable and latest published versions, kept separate</li>
+      <li><b>Version history</b> &ndash; versions, prereleases, platform variants and publication dates</li>
+      <li><b>Transparent results</b> &ndash; ranking signals, data provenance and search-index limitations</li>
     </ul>
-    The server uses MCP Streamable HTTP at <code>http://127.0.0.1:47115/mcp</code> (port configurable in
-    <i>Settings | Tools | Maven Central MCP</i>), listens on the loopback interface only, is read-only, and never
-    reads or modifies project files. No account, telemetry or hosted backend.
+    <h3>MCP tools</h3>
+    <ul>
+      <li><code>search_artifacts</code> &ndash; search Maven Central artifacts</li>
+      <li><code>get_artifact_info</code> &ndash; retrieve artifact metadata</li>
+      <li><code>get_latest_version</code> &ndash; find the latest stable and published versions</li>
+      <li><code>get_versions</code> &ndash; list available versions</li>
+    </ul>
+    <h3>Getting started</h3>
+    <p>Point your MCP client at the Streamable HTTP endpoint <code>http://127.0.0.1:9909/mcp</code>. The port is
+    configurable in <i>Settings | Tools | Maven Central MCP</i>, and <i>Tools | Maven Central MCP | Copy Client
+    Configuration</i> copies a ready-made snippet. The server runs only while the IDE is running.</p>
+    <h3>Security and privacy</h3>
+    <ul>
+      <li><b>Local only</b> &ndash; listens on <code>127.0.0.1</code>, never on a LAN or public interface</li>
+      <li><b>Read-only</b> &ndash; never reads or modifies your project files</li>
+      <li><b>Public data only</b> &ndash; retrieves publicly available Maven Central information</li>
+      <li><b>No accounts, credentials or telemetry</b></li>
+    </ul>
+    <p>Tested with IntelliJ IDEA 2026.1&ndash;2026.2. Open source under the
+    <a href="https://github.com/vankhoango/maven-central-mcp/blob/main/LICENSE">Apache License 2.0</a>;
+    source code, documentation and issues on
+    <a href="https://github.com/vankhoango/maven-central-mcp">GitHub</a>.</p>
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
