@@ -16,6 +16,11 @@ Run before each release against a sandbox IDE (`./gradlew runIde`) or an IDE wit
    `stableLines` per major.
 7. `get_versions {"groupId":"com.google.guava","artifactId":"guava","variant":"android","limit":3}` returns only
    `-android` versions; `limit: 500` or `variant: "ios"` return `isError: true`.
+7a. `get_versions` for `io.ktor:ktor-server-core` (limit 30): recent versions dated with source
+   `repository-file-timestamp`, older ones `search-index`; no blank date without a provenance status.
+7b. `get_artifact_info` for `com.fasterxml.jackson.core:jackson-databind`: developers/organization with source
+   `parent-pom …jackson-bom…`; for `com.squareup.okhttp3:okhttp`: packaging `jar` with source `maven-default …`;
+   no `@` in developer data.
 8. Hold the port with another process, start the IDE: one warning balloon (with **Retry**) and one
    `server not started: Port … is already in use` line in `idea.log`; the IDE keeps working.
 9. Change the port in settings and apply: the server moves to the new port.
@@ -30,6 +35,7 @@ Run before each release against a sandbox IDE (`./gradlew runIde`) or an IDE wit
 |---|---|---|---|
 | Raw HTTP (curl), sandbox IntelliJ IDEA 2026.1 (IU-261.22158.277) | curl 8.x | 2026-11-17 | Pass: items 1–2, 5, 7 (limit), 12; all four tools against live Maven Central. |
 | Python stdlib Streamable HTTP client, sandbox IDEA 2026.1, port 9909 | — | 2026-11-18 | Pass: items 1–7 and 11 against live Maven Central. |
+| Python client, sandbox IDEA 2026.1, port 9909: dates and POM provenance | — | 2026-11-18 | Pass: items 7a–7b; Guava/Ktor/Spring Boot dates, Guava/Jackson/OkHttp/Spring Boot/JUnit metadata. The search index timed out on some calls; affected fields reported `unavailable` with fallbacks. |
 | Port conflict at IDE start (port held by another process), sandbox IDEA 2026.1 | — | 2026-11-18 | Pass: item 8 — exactly one `server not started` warning in `idea.log`, no ERROR entries. Balloon not inspected visually. |
 | IDE stop → port released, connections refused | — | 2026-11-18 | Pass (process stop, not a graceful UI exit). |
 | Kotlin MCP SDK client (automated `EmbeddedMcpHttpServerTest`, `ReconnectionTest`) | 0.9.0 | 2026-11-18 | Pass: initialize, tools/list, tools/call, reconnect after server restart. |

@@ -12,9 +12,9 @@ AI clients can search Maven Central and pick dependency versions. No hosted back
 | Tool | Purpose |
 |---|---|
 | `search_artifacts` | Search (`query`, optional exact `groupId`/`artifactId`/`packaging`, `limit` ≤ 50, `offset`, `includeDescriptions`). Returns ranked results with `rankingSignals`, POM `name`/`description`/`relocatedTo` for the first 5, `totalCount`, `hasMore`. |
-| `get_artifact_info` | Metadata for one `groupId` + `artifactId`: POM name/description/URL/SCM/licenses/relocation, version count, raw "latest" markers, links. |
+| `get_artifact_info` | Metadata for one `groupId` + `artifactId`: POM name/description/URL/SCM/licenses/packaging/developers/organization/relocation (with parent-POM inheritance), version count, raw "latest" markers, links, and per-field `provenance`. |
 | `get_latest_version` | `latestPublishedVersion` (may be a prerelease), `latestStableVersion`, per-platform `variants`, per-major `stableLines`, `uncertain`/`candidates`, `guidance` and the policy text. |
-| `get_versions` | Versions newest-first (`limit` ≤ 100, `offset`, `includePrereleases`, `variant`), each with `prerelease`, `variant` and a timestamp when known; `availableVariants` lists the labels. |
+| `get_versions` | Versions newest-first (`limit` ≤ 100, `offset`, `includePrereleases`, `variant`), each with `prerelease`, `variant` and a publication date with `publishedProvenance`; `availableVariants` lists the labels. |
 
 Every result has a readable text summary and `structuredContent` JSON. Invalid arguments return `isError: true`
 with a message naming the bad field; unknown argument names are rejected.
@@ -23,16 +23,31 @@ with a message naming the bad field; unknown argument names are rejected.
 
 The search index orders by its own text score, so forks and repackages often come first (it lists a WSO2 repackage
 of `okhttp` above `com.squareup.okhttp3:okhttp`). For plain-word queries the plugin re-ranks the top 100 index
-matches by: exact artifactId match (query words joined with `-`), artifactId prefix/term match, a query word in the
-groupId, number of published versions (capped), recency, then index order. Each result lists these facts in
-`rankingSignals`. Ranking never labels an artifact "official"; the notes tell the client to confirm the groupId.
+matches by: exact groupId match (for groupId-shaped queries), exact artifactId match (query words joined with `-`),
+artifactId prefix/term match, a non-generic query word in the groupId (`com`, `org`, `io`, … are ignored), number of
+published versions (capped), recency, then index order. Each result lists these facts in `rankingSignals`. Ranking
+never labels an artifact "official"; the notes tell the client to confirm the groupId.
+
+- **groupId-shaped queries** (`com.fasterxml.jackson.core`): artifacts in exactly that group rank first, then its
+  subgroups (`com.fasterxml.jackson` also boosts `com.fasterxml.jackson.core`). An unrelated artifact whose
+  artifactId equals the query (`com.liferay:com.fasterxml.jackson.core`) only gets a weak signal. The query is never
+  turned into a filter, and a dotted query whose group is not among the matches (`jackson.databind`) is ranked as
+  ordinary free text.
+- **Pagination**: positions 1–100 are re-ranked; later positions keep index order (signal `position N in
+  search-index order`). A page crossing position 100 combines both without gaps or duplicates. An offset at or past
+  `totalCount` returns an empty page with the correct `totalCount` and `hasMore: false`.
 
 - `groupId:artifactId` queries are exact lookups, and fall back to repository metadata if the index lacks the
   artifact. Search expressions (`g:io.ktor*`, `a:okhttp`, `AND`/`OR`, quotes) keep the index order.
-- Results past position 100 are in index order (noted in the response).
+- Search expressions and index-ordered positions still carry signals: index position, a matching `groupId`
+  filter, versions indexed, recency.
+- `indexedLatestVersionPrerelease` classifies `indexedLatestVersion` with the version policy below; the version
+  string is returned unchanged.
 - The search index has no description field. Name and description come from the POM of `indexedLatestVersion` for
-  the first 5 results (one cached request each; skip with `includeDescriptions: false`). `descriptionSource` is
-  `pom:<version>`, `not_loaded` or `unavailable`. Descriptions inherited from a parent POM are not resolved.
+  the first 5 results of each page (one cached request each; skip with `includeDescriptions: false`). If that POM
+  has no description but declares a parent, up to 2 parent POMs are read. `descriptionSource` always mirrors
+  `provenance.description`: the source (`pom:<g:a:v>` or `parent-pom:<g:a:v>`) when found, otherwise the status
+  (`missing`, `unavailable`, `not_loaded`, `unresolved`).
 
 ### Version policy
 
@@ -53,18 +68,48 @@ groupId, number of published versions (capped), recency, then index order. Each 
 - `includeSnapshots` only allows `-SNAPSHOT` versions (if any are listed) to be `latestPublishedVersion`. Maven
   Central does not normally host snapshots.
 
-### Data sources
+### Data sources and provenance
 
-| Data | Source |
+| Data | Source (`provenance.source`) |
 |---|---|
-| Search, packaging, publication timestamps | `https://search.maven.org/solrsearch/select` |
-| Version lists, latest/stable resolution | `https://repo1.maven.org/maven2/<group>/<artifact>/maven-metadata.xml` |
-| Name, description, licenses, SCM, relocation | POMs on `repo1.maven.org` |
+| Search hits, `indexedLatestVersion`, `indexedPackaging`, `indexedVersionCount` | Search index `search.maven.org/solrsearch/select` (`search-index`) |
+| Version lists, latest/stable resolution, `repository*` markers | `repo1.maven.org/maven2/<group>/<artifact>/maven-metadata.xml` (`repository-metadata`) |
+| Name, description, URLs, licenses, packaging, developers, organization, relocation | POM of the latest stable version (`pom <g:a:v>`), parents for inherited fields (`parent-pom <g:a:v>`) |
+| Packaging when the POM declares none | Maven's default `jar` (`maven-default`) |
+| Publication dates | Search index, else the POM file's HTTP `Last-Modified` on the repository (`repository-file-timestamp`) |
+
+POM sources always use one format: `pom:<groupId>:<artifactId>:<version>` and
+`parent-pom:<groupId>:<artifactId>:<version>`.
+
+Every `provenance` entry has a `status`: `present`; `missing` (every relevant source was read and none declares the
+value); `unavailable` (a source could not be read, e.g. the index timed out or a parent POM is unreachable);
+`not_loaded` (not requested to bound network use); or `unresolved` (the value is a `${...}` Maven property, which is
+not evaluated). Values are never guessed.
+
+**POM inheritance.** `description`, `licenses`, `developers` and `organization` follow Maven inheritance through up
+to 3 parent POMs (e.g. Jackson's developers come from `jackson-bom`, 3 levels up). `name` and `packaging` are not
+inherited by Maven. `url` and `scm.url` are read from the artifact's own POM only, because Maven derives the
+inherited value by appending the module path, which is not reproduced here. Developer e-mail addresses are not
+returned.
+
+**Publication dates.** The search index stores a publication time per version but stopped indexing new versions
+around mid-2025, which is why dates for recent versions were blank. Versions it lacks get the upload time of their
+POM file (`Last-Modified`, one cached HEAD request each, at most 25 per `get_versions` call). On 12 sampled versions
+this matched the index time within one second. It is the upload time, not a declared release date. Versions over
+the budget are `not_loaded`; failed lookups are `unavailable`.
 
 The search index can lag far behind the repository (in November 2026 it reported Ktor `3.2.0` while the repository
 had `3.6.1`). Search results label this field `indexedLatestVersion`; use `get_latest_version` for real answers.
 Both hosts are fixed in code; tool arguments cannot change them. Responses are cached in memory for 10 minutes.
 Connection errors and HTTP 502/503/504 are retried once; timeouts and HTTP 429 are not.
+
+### Response changes in 0.1.0 development builds
+
+- `search_artifacts`: `descriptionSource` changed from `pom:<version>` to the provenance source (`pom:<g:a:v>`,
+  `parent-pom:<g:a:v>`) or status; added `indexedLatestVersionPrerelease`; `rankingSignals` is no longer empty for
+  search expressions and index-ordered positions; every result now has `provenance` for `name`, `description` and
+  `relocatedTo`.
+- All tools: POM provenance sources changed from `pom <g:a:v>` to `pom:<g:a:v>` (and `parent-pom:<g:a:v>`).
 
 ## Install
 

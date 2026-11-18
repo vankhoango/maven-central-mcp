@@ -98,6 +98,21 @@ class MavenCentralToolsTest {
     }
 
     @Test
+    fun `dates and metadata expose provenance through MCP`() = runTest {
+        val versions = call("get_versions", buildJsonObject { put("groupId", "com.example"); put("artifactId", "lib") })
+            .structuredContent!!["versions"]!!.jsonArray.map { it.jsonObject }
+        val indexed = versions.single { it["version"]!!.jsonPrimitive.content == "1.10" }
+        assertEquals("search-index", indexed["publishedProvenance"]!!.jsonObject["source"]!!.jsonPrimitive.content)
+        val other = versions.single { it["version"]!!.jsonPrimitive.content == "1.0" }
+        assertEquals("unavailable", other["publishedProvenance"]!!.jsonObject["status"]!!.jsonPrimitive.content)
+
+        val info = call("get_artifact_info", buildJsonObject { put("groupId", "com.example"); put("artifactId", "lib") }).structuredContent!!
+        assertEquals("jar", info["packaging"]!!.jsonPrimitive.content)
+        assertTrue(info["provenance"]!!.jsonObject["packaging"]!!.jsonObject["source"]!!.jsonPrimitive.content.startsWith("maven-default"))
+        assertEquals("jar", info["indexedPackaging"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `get_latest_version includes guidance and stable lines`() = runTest {
         val s = call("get_latest_version", buildJsonObject { put("groupId", "com.example"); put("artifactId", "lib") }).structuredContent!!
         assertTrue(s["guidance"]!!.jsonPrimitive.content.isNotEmpty())

@@ -6,12 +6,21 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.CopyOnWriteArrayList
 
 /** Test double that answers requests from a routing function and records every requested URI. */
-class FakeFetcher(private val route: (URI) -> FetchResponse) : HttpFetcher {
+class FakeFetcher(
+    private val headRoute: ((URI) -> FetchResponse)? = null,
+    private val route: (URI) -> FetchResponse,
+) : HttpFetcher {
     val requests = CopyOnWriteArrayList<URI>()
+    val headRequests = CopyOnWriteArrayList<URI>()
 
     override suspend fun get(uri: URI, accept: String): FetchResponse {
         requests += uri
         return route(uri)
+    }
+
+    override suspend fun head(uri: URI): FetchResponse {
+        headRequests += uri
+        return headRoute?.invoke(uri) ?: route(uri)
     }
 
     companion object {

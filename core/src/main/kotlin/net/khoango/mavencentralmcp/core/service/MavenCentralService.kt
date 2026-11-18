@@ -11,6 +11,7 @@ import net.khoango.mavencentralmcp.core.model.ArtifactInfo
 import net.khoango.mavencentralmcp.core.model.ArtifactSummary
 import net.khoango.mavencentralmcp.core.model.LatestVersionResult
 import net.khoango.mavencentralmcp.core.model.PomMetadata
+import net.khoango.mavencentralmcp.core.model.Provenance
 import net.khoango.mavencentralmcp.core.model.SearchRequest
 import net.khoango.mavencentralmcp.core.model.VariantLatest
 import net.khoango.mavencentralmcp.core.model.StableLine
@@ -34,10 +35,14 @@ import java.time.format.DateTimeFormatter
  */
 class MavenCentralService(private val client: MavenCentralClient = MavenCentralClient()) {
 
+    private val poms = PomResolver(client)
+    private val dates = PublicationDates(client)
+
     /**
      * Searches Maven Central. Empty results are a normal, successful outcome.
      *
-     * Free-text queries are re-ranked locally (see [SearchRanking]); search expressions keep the index order.
+     * Free-text queries are re-ranked locally (see [SearchRanking]) within the top [SearchRanking.POOL_SIZE]
+     * index matches; positions beyond the pool, search expressions and pure filter queries keep the index order.
      * A `groupId:artifactId` query is treated as an exact coordinate lookup and falls back to repository
      * metadata when the (lagging) search index does not know the artifact. POM name/description are loaded
      * for at most [DESCRIPTION_LIMIT] results per call.
@@ -59,32 +64,45 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             if (coordinate != null) null else request.query, groupId, artifactId, request.packaging,
         )
         val terms = if (coordinate == null) SearchRanking.terms(request.query) else null
-        val rerank = terms != null && request.offset + request.limit <= SearchRanking.POOL_SIZE
+        val offset = request.offset
+        val limit = request.limit
+        val pageEnd = offset + limit
 
-        val response = client.searchArtifacts(
-            solrQuery,
-            rows = if (rerank) SearchRanking.POOL_SIZE else request.limit,
-            start = if (rerank) 0 else request.offset,
-        )
-        val candidates = response.docs.orEmpty().mapIndexedNotNull { i, doc ->
-            val g = doc.g?.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
-            val a = doc.a?.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
-            doc to SearchRanking.Candidate(g, a, doc.versionCount, doc.timestamp, i)
-        }
-        val ordered: List<Pair<SolrArtifactDoc, List<String>>> = if (terms != null && rerank) {
+        val ordered = mutableListOf<Pair<SolrArtifactDoc, List<String>>>()
+        var total: Long
+        var reranked = 0
+        var indexOrdered = 0
+        if (terms != null) {
+            // Re-ranked part: positions [offset, min(pageEnd, POOL_SIZE)) of the locally ranked top-100 pool.
+            val pool = client.searchArtifacts(solrQuery, rows = SearchRanking.POOL_SIZE, start = 0)
+            total = pool.numFound ?: pool.docs.orEmpty().size.toLong()
+            val candidates = candidatesOf(pool.docs.orEmpty(), firstPosition = 0)
             val docByCandidate = candidates.associate { it.second to it.first }
-            SearchRanking.rank(terms, candidates.map { it.second })
-                .drop(request.offset).take(request.limit)
-                .map { docByCandidate.getValue(it.candidate) to it.signals }
+            if (offset < SearchRanking.POOL_SIZE) {
+                SearchRanking.rank(terms, candidates.map { it.second }, SearchRanking.groupQuery(request.query))
+                    .drop(offset).take(limit)
+                    .forEach { ordered += docByCandidate.getValue(it.candidate) to it.signals }
+                reranked = ordered.size
+            }
+            // Index-ordered part: positions >= POOL_SIZE, fetched only if they exist.
+            val upstreamStart = maxOf(offset, SearchRanking.POOL_SIZE)
+            if (pageEnd > SearchRanking.POOL_SIZE && upstreamStart < total) {
+                val rows = minOf(pageEnd - upstreamStart, limit)
+                val deep = client.searchArtifacts(solrQuery, rows = rows, start = upstreamStart)
+                ordered += upstreamOrdered(deep.docs.orEmpty(), upstreamStart, groupId)
+                indexOrdered = ordered.size - reranked
+            }
         } else {
-            candidates.take(request.limit).map { it.first to emptyList() }
-        }
-        var total = response.numFound ?: ordered.size.toLong()
-        var results = ordered.mapIndexed { i, (doc, signals) ->
-            toSummary(doc).copy(rank = request.offset + i + 1, rankingSignals = signals)
+            val page = client.searchArtifacts(solrQuery, rows = limit, start = offset)
+            total = page.numFound ?: page.docs.orEmpty().size.toLong()
+            ordered += upstreamOrdered(page.docs.orEmpty(), offset, groupId)
+            indexOrdered = ordered.size
         }
 
-        if (coordinate != null && results.isEmpty() && request.offset == 0) {
+        var results = ordered.mapIndexed { i, (doc, signals) ->
+            toSummary(doc).copy(rank = offset + i + 1, rankingSignals = signals)
+        }
+        if (coordinate != null && results.isEmpty() && offset == 0) {
             repositoryOnlySummary(coordinate)?.let {
                 results = listOf(it)
                 total = 1
@@ -92,83 +110,141 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
                     "this result comes from repository metadata."
             }
         }
-        if (rerank && (response.numFound ?: 0) > SearchRanking.POOL_SIZE) {
-            notes += "Only the top ${SearchRanking.POOL_SIZE} of ${response.numFound} index matches were re-ranked. " +
+
+        // Notes describe the result set actually returned.
+        if (offset >= total && total > 0) {
+            notes += "offset $offset is at or beyond totalCount $total; there are no results on this page. " +
+                "Use an offset below $total."
+        }
+        if (reranked > 0 && total > SearchRanking.POOL_SIZE) {
+            notes += "Only the top ${SearchRanking.POOL_SIZE} of $total index matches are re-ranked. " +
                 "Add words or a groupId/artifactId filter to narrow the search."
         }
-        if (terms != null && !rerank) {
-            notes += "Results past position ${SearchRanking.POOL_SIZE} are in search-index order, not re-ranked."
+        if (terms != null && indexOrdered > 0) {
+            notes += "Results from position ${SearchRanking.POOL_SIZE + 1} onward are in search-index order (not re-ranked)."
         }
-        if (results.size > 1) {
-            notes += "Several publishers can use the same artifactId. Ranking signals are facts, not endorsements; " +
+        val sharedArtifactIds = results.groupBy { it.artifactId }.filterValues { hits -> hits.map { it.groupId }.distinct().size > 1 }
+        if (sharedArtifactIds.isNotEmpty()) {
+            notes += "Several publishers use the same artifactId here (${sharedArtifactIds.keys.take(3).joinToString()}). Ranking signals are facts, not endorsements; " +
                 "confirm the groupId with the project's documentation before adding a dependency."
         }
         if (results.isNotEmpty()) {
             notes += "indexedLatestVersion comes from the search index, can lag behind the repository and may be a " +
-                "prerelease. Use get_latest_version before recommending a version."
+                "prerelease (see indexedLatestVersionPrerelease). Use get_latest_version before recommending a version."
         }
 
         results = when {
             results.isEmpty() -> results
             request.includeDescriptions -> withDescriptions(results, notes)
-            else -> results.also { notes += "Descriptions were not requested (includeDescriptions=false)." }
+            else -> results.map { it.withPomFieldsNotLoaded() }
+                .also { notes += "Descriptions were not requested (includeDescriptions=false)." }
         }
 
         return SearchResultPage(
             query = request.query,
             totalCount = total,
-            offset = request.offset,
-            limit = request.limit,
-            hasMore = request.offset + results.size < total,
-            ranking = if (rerank) SearchRanking.DESCRIPTION else SearchRanking.UPSTREAM_DESCRIPTION,
+            offset = offset,
+            limit = limit,
+            hasMore = offset + results.size < total,
+            ranking = when {
+                reranked > 0 && indexOrdered > 0 -> SearchRanking.MIXED_DESCRIPTION
+                reranked > 0 -> SearchRanking.DESCRIPTION
+                indexOrdered > 0 -> SearchRanking.UPSTREAM_DESCRIPTION
+                terms != null -> SearchRanking.DESCRIPTION
+                else -> SearchRanking.UPSTREAM_DESCRIPTION
+            },
             results = results,
             notes = notes,
         )
     }
 
-    /** Loads POM name/description/relocation for the first [DESCRIPTION_LIMIT] results concurrently. */
+    private fun candidatesOf(docs: List<SolrArtifactDoc>, firstPosition: Int) = docs.mapIndexedNotNull { i, doc ->
+        val g = doc.g?.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
+        val a = doc.a?.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
+        doc to SearchRanking.Candidate(g, a, doc.versionCount, doc.timestamp, firstPosition + i)
+    }
+
+    /** Index-ordered results with factual signals; [start] is the 0-based index position of the first doc. */
+    private fun upstreamOrdered(docs: List<SolrArtifactDoc>, start: Int, groupFilter: String?) =
+        candidatesOf(docs, start).let { candidates ->
+            val newest = candidates.mapNotNull { it.second.timestamp }.maxOrNull()
+            candidates.map { (doc, c) -> doc to SearchRanking.upstreamSignals(c, c.upstreamPosition + 1, newest, groupFilter) }
+        }
+
+    /**
+     * Loads POM name/description/relocation for the first [DESCRIPTION_LIMIT] results of the page concurrently.
+     * If a POM has no description of its own but declares a parent, up to [SEARCH_MAX_PARENTS] parent POMs are
+     * read for the inherited description. `descriptionSource` always equals `provenance.description`'s source
+     * when present, or its status otherwise.
+     */
     private suspend fun withDescriptions(
         results: List<ArtifactSummary>,
         notes: MutableList<String>,
     ): List<ArtifactSummary> = coroutineScope {
-        val head = results.take(DESCRIPTION_LIMIT).map { summary ->
-            async {
-                val version = summary.indexedLatestVersion
-                    ?: return@async summary.copy(descriptionSource = "unavailable")
-                val pom = try {
-                    client.fetchPom(ArtifactCoordinates(summary.groupId, summary.artifactId), version)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: MavenCentralException) {
-                    null
-                }
-                if (pom == null) {
-                    summary.copy(descriptionSource = "unavailable")
-                } else {
-                    summary.copy(
-                        name = pom.name,
-                        description = pom.description,
-                        descriptionSource = "pom:$version",
-                        relocatedTo = pom.relocation,
-                    )
-                }
-            }
-        }.awaitAll()
-        if (head.any { it.descriptionSource == "unavailable" }) {
-            notes += "Some descriptions could not be loaded (POM missing or unreachable); description is null for those."
+        val head = results.take(DESCRIPTION_LIMIT).map { summary -> async { loadPomFields(summary) } }.awaitAll()
+        when {
+            head.any { it.provenance["description"]?.status == Provenance.UNAVAILABLE } ->
+                notes += "Some descriptions could not be loaded (POM or parent POM missing or unreachable)."
         }
-        if (head.any { it.descriptionSource.startsWith("pom:") && it.description == null }) {
-            notes += "Some POMs have no <description> (it may be inherited from a parent POM, which is not resolved)."
+        if (head.any { it.provenance["description"]?.source?.startsWith("parent-pom:") == true }) {
+            notes += "Some descriptions are inherited from a parent POM (descriptionSource parent-pom:...)."
+        }
+        if (head.any { it.provenance["description"]?.status == Provenance.NOT_LOADED }) {
+            notes += "Some descriptions may be inherited from parent POMs beyond the $SEARCH_MAX_PARENTS levels search " +
+                "reads (status not_loaded); get_artifact_info reads deeper."
         }
         if (head.any { it.relocatedTo != null }) {
             notes += "relocatedTo means the publisher moved the artifact to new coordinates; prefer the new coordinates."
         }
         if (results.size > DESCRIPTION_LIMIT) {
-            notes += "Descriptions are loaded for the first $DESCRIPTION_LIMIT results only; " +
-                "call get_artifact_info for the others."
+            notes += "Descriptions are loaded for the first $DESCRIPTION_LIMIT results of each page only " +
+                "(descriptionSource not_loaded for the rest); call get_artifact_info for the others."
         }
-        head + results.drop(DESCRIPTION_LIMIT)
+        head + results.drop(DESCRIPTION_LIMIT).map { it.withPomFieldsNotLoaded() }
     }
+
+    private suspend fun loadPomFields(summary: ArtifactSummary): ArtifactSummary {
+        val version = summary.indexedLatestVersion
+            ?: return summary.withPomFields(Provenance(Provenance.UNAVAILABLE, Provenance.SEARCH_INDEX))
+        val coordinates = ArtifactCoordinates(summary.groupId, summary.artifactId)
+        val pomSource = Provenance.pomSource(summary.groupId, summary.artifactId, version)
+        val pom = try {
+            // Own POM first; parents only when the description could be inherited (cached GETs).
+            poms.resolve(coordinates, version, maxParents = 0)?.let { own ->
+                if (own.provenance["description"]?.status == Provenance.NOT_LOADED) {
+                    poms.resolve(coordinates, version, maxParents = SEARCH_MAX_PARENTS)
+                } else {
+                    own
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: MavenCentralException) {
+            null
+        } ?: return summary.withPomFields(Provenance(Provenance.UNAVAILABLE, pomSource))
+        return summary.copy(
+            name = pom.name,
+            description = pom.description,
+            relocatedTo = pom.relocation,
+        ).withPomProvenance(
+            name = pom.provenance.getValue("name"),
+            description = pom.provenance.getValue("description"),
+            relocatedTo = pom.provenance.getValue("relocation"),
+        )
+    }
+
+    private fun ArtifactSummary.withPomFieldsNotLoaded(): ArtifactSummary = withPomFields(
+        Provenance(Provenance.NOT_LOADED, indexedLatestVersion?.let { Provenance.pomSource(groupId, artifactId, it) }),
+    )
+
+    private fun ArtifactSummary.withPomFields(all: Provenance) = withPomProvenance(all, all, all)
+
+    /** Sets POM-derived provenance and keeps `descriptionSource` consistent with `provenance.description`. */
+    private fun ArtifactSummary.withPomProvenance(name: Provenance, description: Provenance, relocatedTo: Provenance) =
+        copy(
+            descriptionSource = descriptionSourceOf(description),
+            provenance = provenance + mapOf("name" to name, "description" to description, "relocatedTo" to relocatedTo),
+        )
 
     /** Builds a search result from maven-metadata.xml for an artifact missing from the search index. */
     private suspend fun repositoryOnlySummary(c: ArtifactCoordinates): ArtifactSummary? {
@@ -182,17 +258,38 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             lastUpdatedEpochMillis = null,
             lastUpdated = metadata.lastUpdated?.let(::formatMetadataTimestamp),
             indexedVersionCount = metadata.versions.size,
+            indexedLatestVersionPrerelease = (metadata.release ?: metadata.latest)?.let(VersionPolicy::isPrerelease),
             rank = 1,
             rankingSignals = listOf("exact coordinate match (repository metadata)"),
+            provenance = mapOf(
+                "indexedLatestVersion" to Provenance.present(Provenance.REPOSITORY_METADATA),
+                "packaging" to Provenance(Provenance.NOT_LOADED, (metadata.release ?: metadata.latest)?.let { Provenance.pomSource(c.groupId, c.artifactId, it) }),
+                "lastUpdated" to Provenance.present(Provenance.REPOSITORY_METADATA),
+                "indexedVersionCount" to Provenance.present(Provenance.REPOSITORY_METADATA),
+            ),
         )
     }
 
-    /** Metadata for one exact coordinate. Throws [MavenCentralException.ArtifactNotFound] if unknown. */
+    /**
+     * Metadata for one exact coordinate. Throws [MavenCentralException.ArtifactNotFound] if unknown.
+     * Reads repository metadata, the search index, the POM of the latest stable version and up to
+     * [PomResolver.INFO_MAX_PARENTS] parent POMs (all cached). Every top-level field has a provenance entry.
+     */
     suspend fun getArtifactInfo(coordinates: ArtifactCoordinates): ArtifactInfo = coroutineScope {
         val notes = mutableListOf<String>()
-        val indexed = async { bestEffort(notes, "search index") { findIndexedArtifact(coordinates) } }
+        val indexed = async {
+            try {
+                Result.success(findIndexedArtifact(coordinates))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: MavenCentralException) {
+                Result.failure(e)
+            }
+        }
         val metadata = client.fetchMetadata(coordinates)
-        val doc = indexed.await()
+        val indexResult = indexed.await()
+        val doc = indexResult.getOrNull()
+        indexResult.exceptionOrNull()?.let { notes += "Could not load search index: ${it.message}" }
         if (metadata == null && doc == null) {
             throw MavenCentralException.ArtifactNotFound(coordinates.groupId, coordinates.artifactId)
         }
@@ -200,27 +297,79 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
         val versions = metadata?.versions.orEmpty()
         val stable = VersionPolicy.pickNewest(versions.filterNot(VersionPolicy::isPrerelease)).version
         val pomVersion = stable ?: metadata?.release ?: metadata?.latest ?: doc?.latestVersion
+        var pomFailure: String? = null
         val pom: PomMetadata? = pomVersion?.let { v ->
-            bestEffort(notes, "POM") { client.fetchPom(coordinates, v) }
+            try {
+                poms.resolve(coordinates, v, PomResolver.INFO_MAX_PARENTS).also {
+                    if (it == null) pomFailure = "not found"
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: MavenCentralException) {
+                pomFailure = e.message
+                null
+            }
         }
+        pomFailure?.let { notes += "Could not load the POM of $pomVersion: $it" }
+
+        // Provenance of the top-level fields.
+        val indexStatus = when {
+            indexResult.isFailure -> Provenance(Provenance.UNAVAILABLE, Provenance.SEARCH_INDEX)
+            doc == null -> Provenance(Provenance.MISSING, Provenance.SEARCH_INDEX)
+            else -> null
+        }
+        fun fromIndex(value: Any?) = indexStatus
+            ?: if (value != null) Provenance.present(Provenance.SEARCH_INDEX) else Provenance(Provenance.MISSING, Provenance.SEARCH_INDEX)
+        fun fromMetadata(value: Any?) = if (metadata != null && value != null) {
+            Provenance.present(Provenance.REPOSITORY_METADATA)
+        } else {
+            Provenance(Provenance.MISSING, Provenance.REPOSITORY_METADATA)
+        }
+        val pomSource = pomVersion?.let { Provenance.pomSource(coordinates.groupId, coordinates.artifactId, it) }
+        val pomProvenance = when {
+            pom != null -> Provenance.present(Provenance.pomSource(coordinates.groupId, coordinates.artifactId, pom.version))
+            pomVersion == null -> Provenance(Provenance.MISSING, pomSource)
+            else -> Provenance(Provenance.UNAVAILABLE, pomSource)
+        }
+        val packagingProvenance = pom?.provenance?.get("packaging") ?: pomProvenance
+        val provenance = linkedMapOf(
+            "packaging" to packagingProvenance,
+            "indexedPackaging" to fromIndex(doc?.packaging),
+            "indexedLatestVersion" to fromIndex(doc?.latestVersion),
+            "indexedLastUpdated" to fromIndex(doc?.timestamp),
+            "repositoryLatestVersion" to fromMetadata(metadata?.latest),
+            "repositoryReleaseVersion" to fromMetadata(metadata?.release),
+            "repositoryLastUpdated" to fromMetadata(metadata?.lastUpdated),
+            "versionCount" to if (metadata != null) Provenance.present(Provenance.REPOSITORY_METADATA) else fromIndex(doc?.versionCount),
+            "pom" to pomProvenance,
+        )
 
         if (metadata == null) {
             notes += "Repository metadata (maven-metadata.xml) was not found; only search-index data is shown."
         }
-        if (doc == null) {
+        if (doc == null && indexResult.isSuccess) {
             notes += "The artifact is not present in the search index (the index can lag behind the repository)."
         }
         if (doc?.latestVersion != null && metadata?.release != null && doc.latestVersion != metadata.release) {
             notes += "The search index reports '${doc.latestVersion}' but repository metadata reports " +
                 "'${metadata.release}'; the search index can lag behind. Prefer get_latest_version."
         }
-        if (pom != null) notes += "Descriptive fields come from the POM of version ${pom.version}; inherited parent-POM values are not resolved."
+        if (pom != null) {
+            notes += "POM fields describe version ${pom.version}. description, licenses, developers and organization " +
+                "follow Maven inheritance through up to ${PomResolver.INFO_MAX_PARENTS} parent POMs; name, packaging, " +
+                "projectUrl and scmUrl are read from the artifact's own POM only. See pom.provenance."
+            if (pom.provenance.values.any { it.status == Provenance.UNRESOLVED }) {
+                notes += "Some POM values contain \${...} property expressions, which are not evaluated (status unresolved)."
+            }
+            notes += "Developer e-mail addresses are not returned."
+        }
         notes += "indexedLatestVersion and repositoryReleaseVersion are not guaranteed to be stable versions; use get_latest_version."
 
         ArtifactInfo(
             groupId = coordinates.groupId,
             artifactId = coordinates.artifactId,
-            packaging = doc?.packaging,
+            packaging = pom?.packaging,
+            indexedPackaging = doc?.packaging,
             indexedLatestVersion = doc?.latestVersion,
             indexedLastUpdated = doc?.timestamp?.let(::formatEpochMillis),
             repositoryLatestVersion = metadata?.latest,
@@ -229,6 +378,7 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             versionCount = metadata?.versions?.size ?: doc?.versionCount,
             pom = pom,
             links = links(coordinates),
+            provenance = provenance,
             notes = notes,
         )
     }
@@ -260,12 +410,7 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             notes += "This artifact publishes platform variants (${availableVariants.joinToString()}); they are " +
                 "parallel builds, not newer/older versions of each other. Filter with 'variant' to list one."
         }
-        val timestamps = if (page.isEmpty()) emptyMap() else bestEffort(notes, "publication timestamps") {
-            indexedTimestamps(coordinates)
-        }.orEmpty()
-        if (page.any { it !in timestamps }) {
-            notes += "Publication timestamps come from the search index; versions it has not indexed have no timestamp."
-        }
+        val published = dates.lookup(coordinates, page, PublicationDates.VERSIONS_FILE_TIMESTAMP_BUDGET, notes)
         if (offset >= filtered.size && filtered.isNotEmpty()) {
             notes += "offset $offset is past the end of the list (${filtered.size} versions)."
         }
@@ -282,8 +427,15 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             availableVariants = availableVariants,
             ordering = ORDERING_DESCRIPTION,
             versions = page.map { v ->
-                val ts = timestamps[v]
-                VersionEntry(v, VersionPolicy.isPrerelease(v), VersionPolicy.variantOf(v), ts, ts?.let(::formatEpochMillis))
+                val date = published.getValue(v)
+                VersionEntry(
+                    version = v,
+                    prerelease = VersionPolicy.isPrerelease(v),
+                    variant = VersionPolicy.variantOf(v),
+                    publishedEpochMillis = date.epochMillis,
+                    published = date.epochMillis?.let(::formatEpochMillis),
+                    publishedProvenance = date.provenance,
+                )
             },
             notes = notes,
         )
@@ -317,17 +469,22 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
         }
         notes += SNAPSHOT_NOTE
 
-        val timestamps = if (eligible.isEmpty()) emptyMap() else bestEffort(notes, "publication timestamps") {
-            indexedTimestamps(coordinates)
-        }.orEmpty()
+        val timestamps = dates.lookup(
+            coordinates, listOfNotNull(published.version, stable.version).distinct(), fileTimestampBudget = 2, notes,
+        )
+        val noVersion = Provenance(Provenance.MISSING, Provenance.REPOSITORY_METADATA)
 
         return LatestVersionResult(
             groupId = coordinates.groupId,
             artifactId = coordinates.artifactId,
             latestPublishedVersion = published.version,
             latestStableVersion = stable.version,
-            latestPublishedTimestamp = published.version?.let(timestamps::get)?.let(::formatEpochMillis),
-            latestStableTimestamp = stable.version?.let(timestamps::get)?.let(::formatEpochMillis),
+            latestPublishedTimestamp = published.version?.let { timestamps[it]?.epochMillis }?.let(::formatEpochMillis),
+            latestStableTimestamp = stable.version?.let { timestamps[it]?.epochMillis }?.let(::formatEpochMillis),
+            timestampProvenance = mapOf(
+                "latestPublishedTimestamp" to (published.version?.let { timestamps[it]?.provenance } ?: noVersion),
+                "latestStableTimestamp" to (stable.version?.let { timestamps[it]?.provenance } ?: noVersion),
+            ),
             versionCount = eligible.size,
             repositoryReleaseVersion = release,
             repositoryLastUpdated = metadata.lastUpdated?.let(::formatMetadataTimestamp),
@@ -370,22 +527,6 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             .firstOrNull { it.g == c.groupId && it.a == c.artifactId }
     }
 
-    private suspend fun indexedTimestamps(c: ArtifactCoordinates): Map<String, Long> =
-        client.searchVersions(c, rows = TIMESTAMP_LOOKUP_ROWS).docs.orEmpty()
-            .filter { it.g == c.groupId && it.a == c.artifactId }
-            .mapNotNull { doc -> doc.v?.let { v -> doc.timestamp?.let { v to it } } }
-            .toMap()
-
-    /** Runs an optional enrichment step; failures become a note instead of failing the whole call. */
-    private suspend fun <T> bestEffort(notes: MutableList<String>, what: String, block: suspend () -> T?): T? = try {
-        block()
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: MavenCentralException) {
-        synchronized(notes) { notes += "Could not load $what: ${e.message}" }
-        null
-    }
-
     /** Maps a document whose g/a were already checked to be non-blank. */
     private fun toSummary(doc: SolrArtifactDoc): ArtifactSummary {
         val g = doc.g!!
@@ -394,13 +535,23 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             groupId = g,
             artifactId = a,
             indexedLatestVersion = doc.latestVersion,
+            indexedLatestVersionPrerelease = doc.latestVersion?.let(VersionPolicy::isPrerelease),
             packaging = doc.packaging,
             url = centralUrl(g, a),
             lastUpdatedEpochMillis = doc.timestamp,
             lastUpdated = doc.timestamp?.let(::formatEpochMillis),
             indexedVersionCount = doc.versionCount,
+            provenance = mapOf(
+                "indexedLatestVersion" to indexField(doc.latestVersion),
+                "packaging" to indexField(doc.packaging),
+                "lastUpdated" to indexField(doc.timestamp),
+                "indexedVersionCount" to indexField(doc.versionCount),
+            ),
         )
     }
+
+    private fun indexField(value: Any?) =
+        if (value != null) Provenance.present(Provenance.SEARCH_INDEX) else Provenance(Provenance.MISSING, Provenance.SEARCH_INDEX)
 
     companion object {
         /** Maximum number of POMs fetched per search call to fill in descriptions. */
@@ -432,8 +583,16 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
                 "already uses unless upgrading deliberately (see stableLines); respect versions managed by a BOM or " +
                 "platform (Spring Boot, Kotlin, AndroidX); prefer latestStableVersion over prereleases unless asked."
 
-        /** Number of version documents requested from the search index to look up publication timestamps. */
-        const val TIMESTAMP_LOOKUP_ROWS = 200
+        /** Parent POM levels search reads, only when a result's own POM has no description. */
+        const val SEARCH_MAX_PARENTS = 2
+
+        /**
+         * `descriptionSource` value for a description provenance: the source label when a description was found
+         * (`pom:g:a:v` or `parent-pom:g:a:v`), otherwise the status (`missing`, `unavailable`, `not_loaded`,
+         * `unresolved`). This keeps `descriptionSource` and `provenance.description` from ever disagreeing.
+         */
+        internal fun descriptionSourceOf(p: Provenance): String =
+            if (p.status == Provenance.PRESENT && p.source != null) p.source else p.status
 
         const val ORDERING_DESCRIPTION =
             "Newest first by Maven version ordering (Apache Maven ComparableVersion), computed locally from the " +

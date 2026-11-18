@@ -27,6 +27,9 @@ class FetchResponse(val status: Int, val body: ByteArray, private val headers: M
  */
 fun interface HttpFetcher {
     suspend fun get(uri: URI, accept: String): FetchResponse
+
+    /** HEAD request; only status and headers are meaningful. Defaults to [get] for simple implementations. */
+    suspend fun head(uri: URI): FetchResponse = get(uri, "*/*")
 }
 
 class ResponseTooLargeException(limit: Long) : java.io.IOException("Response exceeded $limit bytes")
@@ -61,6 +64,16 @@ class JdkHttpFetcher(
             response.body().use { readBounded(it, maxBodyBytes) }
         }
         return FetchResponse(response.statusCode(), body, response.headers().map())
+    }
+
+    override suspend fun head(uri: URI): FetchResponse {
+        val request = HttpRequest.newBuilder(uri)
+            .timeout(requestTimeout)
+            .header("User-Agent", userAgent)
+            .method("HEAD", HttpRequest.BodyPublishers.noBody())
+            .build()
+        val response = client.sendAsync(request, HttpResponse.BodyHandlers.discarding()).await()
+        return FetchResponse(response.statusCode(), ByteArray(0), response.headers().map())
     }
 
     companion object {

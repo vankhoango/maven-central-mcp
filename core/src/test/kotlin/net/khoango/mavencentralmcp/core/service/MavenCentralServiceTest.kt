@@ -22,7 +22,7 @@ import java.net.URI
 class MavenCentralServiceTest {
     private val lib = ArtifactCoordinates("com.example", "lib")
 
-    private fun service(route: (URI) -> FetchResponse) = MavenCentralService(MavenCentralClient(FakeFetcher(route)))
+    private fun service(route: (URI) -> FetchResponse) = MavenCentralService(MavenCentralClient(FakeFetcher(route = route)))
 
     private val emptySearch = """{"response":{"numFound":0,"start":0,"docs":[]}}"""
 
@@ -148,7 +148,9 @@ class MavenCentralServiceTest {
         }
         val page = svc.getVersions(lib, 10, 0, true)
         assertEquals(listOf("1.0"), page.versions.map { it.version })
-        assertTrue(page.notes.any { it.startsWith("Could not load publication timestamps") })
+        assertTrue(page.notes.any { it.startsWith("The search index could not be read for publication dates") })
+        // The repository answered without a Last-Modified header, so the date is explicitly unavailable.
+        assertEquals("unavailable", page.versions.single().publishedProvenance.status)
     }
 
     @Test

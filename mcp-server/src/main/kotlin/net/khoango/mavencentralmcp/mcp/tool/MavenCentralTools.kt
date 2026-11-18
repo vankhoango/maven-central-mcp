@@ -61,16 +61,20 @@ class MavenCentralTools(private val service: MavenCentralService) {
         title = "Search Maven Central artifacts",
         description = """
             Search Maven Central for artifacts. Free-text terms (e.g. 'jackson databind', 'okhttp') match groupId and
-            artifactId tokens, not descriptions, and are re-ranked locally: exact artifactId match first, then a query
-            term in the groupId, number of published versions and recency. Each result lists its 'rankingSignals'.
+            artifactId tokens, not descriptions, and the top 100 matches are re-ranked locally: for a groupId-shaped
+            query (e.g. 'com.fasterxml.jackson.core') artifacts in exactly that group come first; otherwise exact
+            artifactId match first, then a query term in the groupId, number of published versions and recency.
+            Every result lists its 'rankingSignals' (index-ordered results state their index position).
             Ranking is a heuristic and does NOT prove who publishes an artifact; several publishers often share an
             artifactId (forks, repackages), so compare groupId, indexedVersionCount, description and relocatedTo.
             An exact 'groupId:artifactId' query looks up that coordinate. Search expressions such as 'g:com.squareup*'
             or 'a:okhttp' are passed through in index order. Optional groupId/artifactId/packaging filters are exact.
-            POM name/description are loaded for the first ${MavenCentralService.DESCRIPTION_LIMIT} results only
-            (descriptionSource tells whether they were read). Paginated (limit default ${ArgumentValidator.SEARCH_DEFAULT_LIMIT},
+            POM name/description are loaded for the first ${MavenCentralService.DESCRIPTION_LIMIT} results of each page
+            (from up to ${MavenCentralService.SEARCH_MAX_PARENTS} parent POMs if inherited); descriptionSource is the
+            source (pom:<g:a:v> or parent-pom:<g:a:v>) or the status missing/unavailable/not_loaded/unresolved. Paginated (limit default ${ArgumentValidator.SEARCH_DEFAULT_LIMIT},
             max ${ArgumentValidator.SEARCH_MAX_LIMIT}) with totalCount; an empty 'results' list means nothing matched.
-            'indexedLatestVersion' comes from the search index, can lag behind the repository and may be a prerelease;
+            'indexedLatestVersion' comes from the search index, can lag behind the repository and may be a prerelease
+            ('indexedLatestVersionPrerelease');
             call get_latest_version before recommending a version.
         """.trimIndent(),
         inputSchema = schema(
@@ -113,9 +117,15 @@ class MavenCentralTools(private val service: MavenCentralService) {
         name = GET_ARTIFACT_INFO,
         title = "Get Maven artifact metadata",
         description = """
-            Get metadata for one exact Maven coordinate (groupId + artifactId): packaging, POM name/description/
-            project URL/SCM/licenses (from the latest stable version's POM), version count, repository and search-index
-            'latest' markers, and links. Returns an error result if the artifact does not exist.
+            Get metadata for one exact Maven coordinate (groupId + artifactId), from the POM of the latest stable
+            version: name, description, project URL, SCM URL, licenses, packaging, developers (without e-mail),
+            organization and relocation; plus version count, repository and search-index 'latest' markers, and links.
+            description/licenses/developers/organization follow Maven inheritance through up to 3 parent POMs.
+            'provenance' (top level and in 'pom') gives each field's source (pom:<g:a:v>, parent-pom:<g:a:v>,
+            repository-metadata, search-index, maven-default) or why it is absent: missing (checked, not declared),
+            unavailable (source could not be read), not_loaded (not requested), unresolved (unevaluated ${'$'}{...}).
+            'packaging' comes from the POM (Maven's 'jar' default when undeclared, labelled maven-default);
+            'indexedPackaging' is the search index's value. Returns an error result if the artifact does not exist.
             The 'indexedLatestVersion', 'repositoryLatestVersion' and 'repositoryReleaseVersion' fields are raw
             repository markers and are NOT guaranteed to be stable; use get_latest_version for that.
         """.trimIndent(),
@@ -172,7 +182,10 @@ class MavenCentralTools(private val service: MavenCentralService) {
             List versions of a Maven artifact, newest first by Maven version ordering (Apache Maven ComparableVersion,
             computed locally; not lexicographic and not deploy order). Version strings are returned exactly as published.
             Each entry has a 'prerelease' flag (same policy as get_latest_version), a platform 'variant' label (null for
-            plain releases) and a publication timestamp when the search index knows it. 'availableVariants' lists the
+            plain releases) and a publication date with 'publishedProvenance': from the search index (which stopped
+            indexing new versions around mid-2025), else the upload time of the version's POM file on the repository
+            (repository-file-timestamp, up to 25 lookups per call); otherwise status unavailable or not_loaded, never
+            guessed. These are upload times, not declared release dates. 'availableVariants' lists the
             labels; pass 'variant' (e.g. 'android', or 'none' for plain releases) to list one variant only. Paginated: limit default ${ArgumentValidator.VERSIONS_DEFAULT_LIMIT}, max ${ArgumentValidator.VERSIONS_MAX_LIMIT}; totalCount and hasMore are returned.
         """.trimIndent(),
         inputSchema = coordinateSchema(

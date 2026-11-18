@@ -7,19 +7,22 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import net.khoango.mavencentralmcp.core.error.MavenCentralException
 import net.khoango.mavencentralmcp.core.model.ArtifactCoordinates
-import net.khoango.mavencentralmcp.core.model.PomMetadata
 import net.khoango.mavencentralmcp.maven.cache.TtlCache
 import net.khoango.mavencentralmcp.maven.dto.SolrArtifactDoc
 import net.khoango.mavencentralmcp.maven.dto.SolrEnvelope
 import net.khoango.mavencentralmcp.maven.dto.SolrGavDoc
 import net.khoango.mavencentralmcp.maven.dto.SolrResponse
 import net.khoango.mavencentralmcp.maven.mapper.MavenMetadata
+import net.khoango.mavencentralmcp.maven.mapper.RawPom
 import net.khoango.mavencentralmcp.maven.mapper.XmlParsers
 import java.io.IOException
 import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpTimeoutException
 import java.nio.charset.StandardCharsets
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
@@ -43,6 +46,7 @@ class MavenCentralClient(
     cacheMaxEntries: Int = 256,
 ) {
     private val cache = TtlCache<String, ByteArray>(cacheMaxEntries, cacheTtl)
+    private val lastModifiedCache = TtlCache<String, Long>(cacheMaxEntries * 4, cacheTtl)
     private val json = Json { ignoreUnknownKeys = true; isLenient = false }
 
     /** Artifact-level search. [solrQuery] must already be a safe Solr expression (see [buildSearchQuery]). */
@@ -57,11 +61,12 @@ class MavenCentralClient(
         coordinates: ArtifactCoordinates,
         rows: Int,
         version: String? = null,
+        start: Int = 0,
     ): SolrResponse<SolrGavDoc> {
         var q = "g:${quote(coordinates.groupId)} AND a:${quote(coordinates.artifactId)}"
         if (version != null) q += " AND v:${quote(version)}"
         return getSolr(
-            params = linkedMapOf("q" to q, "core" to "gav", "rows" to rows.toString(), "start" to "0", "wt" to "json"),
+            params = linkedMapOf("q" to q, "core" to "gav", "rows" to rows.toString(), "start" to start.toString(), "wt" to "json"),
             serializer = SolrEnvelope.serializer(SolrGavDoc.serializer()),
         )
     }
@@ -78,20 +83,47 @@ class MavenCentralClient(
     }
 
     /**
-     * Fetches descriptive metadata from the POM of [version]. Returns null if the POM does not exist or
-     * the version string is not safe to embed in a URL path.
+     * Fetches and parses one POM file (no inheritance). Returns null if the POM does not exist or the
+     * version string is not safe to embed in a URL path.
      */
-    internal suspend fun fetchPom(coordinates: ArtifactCoordinates, version: String): PomMetadata? {
-        if (!SAFE_VERSION.matches(version) || ".." in version) return null
-        val uri = URI.create(
-            "$REPOSITORY_URL/${artifactPath(coordinates)}/$version/${coordinates.artifactId}-$version.pom",
-        )
+    internal suspend fun fetchRawPom(coordinates: ArtifactCoordinates, version: String): RawPom? {
+        val uri = pomUri(coordinates, version) ?: return null
         val bytes = getBytes(uri, "application/xml, text/xml") ?: return null
         return try {
-            XmlParsers.parsePom(bytes, version)
+            XmlParsers.parsePom(bytes)
         } catch (e: Exception) {
             throw MavenCentralException.MalformedUpstreamResponse("Maven Central returned an unreadable POM.", e)
         }
+    }
+
+    /**
+     * Upload time of a version, taken from the HTTP `Last-Modified` header of its POM file (a HEAD request; the
+     * file is not downloaded). Returns null if the POM does not exist or the header is absent or unparsable.
+     */
+    internal suspend fun fetchPomLastModified(coordinates: ArtifactCoordinates, version: String): Long? {
+        val uri = pomUri(coordinates, version) ?: return null
+        val key = uri.toString()
+        lastModifiedCache.get(key)?.let { return it }
+        val response = try {
+            fetcher.head(uri)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: HttpTimeoutException) {
+            throw MavenCentralException.UpstreamTimeout(e)
+        } catch (e: IOException) {
+            throw MavenCentralException.UpstreamUnavailable("Could not reach Maven Central. Check the network connection.", e)
+        }
+        return when (val status = response.status) {
+            in 200..299 -> parseHttpDate(response.header("Last-Modified"))?.also { lastModifiedCache.put(key, it) }
+            404 -> null
+            429 -> throw MavenCentralException.RateLimited(parseRetryAfter(response.header("Retry-After")))
+            else -> throw MavenCentralException.UpstreamUnavailable("Maven Central returned HTTP $status.")
+        }
+    }
+
+    private fun pomUri(coordinates: ArtifactCoordinates, version: String): URI? {
+        if (!SAFE_VERSION.matches(version) || ".." in version) return null
+        return URI.create("$REPOSITORY_URL/${artifactPath(coordinates)}/$version/${coordinates.artifactId}-$version.pom")
     }
 
     private suspend fun <T> getSolr(
@@ -208,6 +240,13 @@ class MavenCentralClient(
                 filters.isEmpty() -> query
                 else -> (listOf("($query)") + filters).joinToString(" AND ")
             }
+        }
+
+        /** Parses an RFC 1123 HTTP date to epoch milliseconds, or null. */
+        internal fun parseHttpDate(value: String?): Long? = try {
+            value?.let { ZonedDateTime.parse(it.trim(), DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli() }
+        } catch (_: DateTimeParseException) {
+            null
         }
 
         /** Parses `Retry-After` given in seconds; HTTP-date values are ignored. Capped at one hour. */

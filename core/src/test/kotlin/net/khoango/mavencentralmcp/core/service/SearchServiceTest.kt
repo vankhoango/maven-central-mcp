@@ -2,6 +2,7 @@ package net.khoango.mavencentralmcp.core.service
 
 import kotlinx.coroutines.test.runTest
 import net.khoango.mavencentralmcp.core.error.MavenCentralException
+import net.khoango.mavencentralmcp.core.model.Provenance
 import net.khoango.mavencentralmcp.core.model.SearchRequest
 import net.khoango.mavencentralmcp.maven.api.FakeFetcher
 import net.khoango.mavencentralmcp.maven.api.FakeFetcher.Companion.metadataXml
@@ -35,7 +36,7 @@ class SearchServiceTest {
         "<project><name>$name</name>${description?.let { "<description>$it</description>" } ?: ""}$relocation</project>"
 
     private fun setup(route: (URI) -> FetchResponse): Pair<MavenCentralService, FakeFetcher> {
-        val fetcher = FakeFetcher(route)
+        val fetcher = FakeFetcher(route = route)
         return MavenCentralService(MavenCentralClient(fetcher)) to fetcher
     }
 
@@ -65,9 +66,9 @@ class SearchServiceTest {
         val page = svc.search(SearchRequest("lib", limit = 7, offset = 0))
         assertEquals(5, fetcher.requests.count { it.path.endsWith(".pom") })
         assertEquals(List(5) { "Does things" } + listOf(null, null), page.results.map { it.description })
-        assertEquals("pom:1.0", page.results[0].descriptionSource)
+        assertEquals("pom:com.example1:lib:1.0", page.results[0].descriptionSource)
         assertEquals("not_loaded", page.results[6].descriptionSource)
-        assertTrue(page.notes.any { "first 5 results only" in it })
+        assertTrue(page.notes.any { "first 5 results of each page" in it })
     }
 
     @Test
@@ -91,7 +92,12 @@ class SearchServiceTest {
         val byGroup = svc.search(SearchRequest("okhttp", limit = 3, offset = 0)).results.associateBy { it.groupId }
         assertEquals("OkHttp", byGroup.getValue("com.squareup.okhttp3").name)
         assertNull(byGroup.getValue("com.squareup.okhttp3").description)
-        assertEquals("pom:5.0.0-alpha.16", byGroup.getValue("com.squareup.okhttp3").descriptionSource)
+        // The POM was read and has no description and no parent: missing (not not_loaded).
+        assertEquals("missing", byGroup.getValue("com.squareup.okhttp3").descriptionSource)
+        assertEquals(
+            Provenance(Provenance.MISSING, "pom:com.squareup.okhttp3:okhttp:5.0.0-alpha.16"),
+            byGroup.getValue("com.squareup.okhttp3").provenance["description"],
+        )
         assertEquals("unavailable", byGroup.getValue("com.avito.android").descriptionSource)
     }
 
@@ -149,12 +155,13 @@ class SearchServiceTest {
     }
 
     @Test
-    fun `deep pages use index order`() = runTest {
+    fun `deep pages beyond the re-ranked pool use index order`() = runTest {
         val (svc, fetcher) = setup { uri -> if (uri.host == "search.maven.org") ok(okhttpPool) else status(404) }
-        val page = svc.search(SearchRequest("okhttp", limit = 10, offset = 95, includeDescriptions = false))
-        assertEquals("95", fetcher.requests.first().param("start"))
+        val page = svc.search(SearchRequest("okhttp", limit = 10, offset = 150, includeDescriptions = false))
+        assertEquals(listOf("0", "150"), fetcher.requests.map { it.param("start") })
         assertTrue(page.ranking.startsWith("Maven Central search index order"))
         assertTrue(page.notes.any { "not re-ranked" in it })
+        assertTrue(page.results.first().rankingSignals.first().startsWith("position 151 in search-index order"))
     }
 
     @Test

@@ -160,8 +160,8 @@ class MavenCentralClientTest {
     @Test
     fun `unsafe version strings are never used in pom urls`() = runTest {
         val fetcher = FakeFetcher { ok("<project/>") }
-        assertNull(MavenCentralClient(fetcher).fetchPom(guava, "../../x"))
-        assertNull(MavenCentralClient(fetcher).fetchPom(guava, "1.0/evil"))
+        assertNull(MavenCentralClient(fetcher).fetchRawPom(guava, "../../x"))
+        assertNull(MavenCentralClient(fetcher).fetchRawPom(guava, "1.0/evil"))
         assertTrue(fetcher.requests.isEmpty())
     }
 

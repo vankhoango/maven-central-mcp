@@ -2,6 +2,7 @@ package net.khoango.mavencentralmcp.maven.mapper
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 
@@ -59,14 +60,48 @@ class XmlParsersTest {
               </relocation></distributionManagement>
             </project>
         """.trimIndent()
-        val p = XmlParsers.parsePom(pom.toByteArray(), "8.0.33")
+        val p = XmlParsers.parsePom(pom.toByteArray())
         assertEquals("com.mysql:mysql-connector-j", p.relocation)
         assertEquals("MySQL Connector/J artifacts moved to reverse-DNS compliant Maven 2+ coordinates.", p.relocationMessage)
 
         val onlyVersion = "<project><groupId>g</groupId><artifactId>a</artifactId><distributionManagement>" +
             "<relocation><version>2.0</version></relocation></distributionManagement></project>"
-        assertEquals("g:a:2.0", XmlParsers.parsePom(onlyVersion.toByteArray(), "1.0").relocation)
-        assertNull(XmlParsers.parsePom("<project/>".toByteArray(), "1.0").relocation)
+        assertEquals("g:a:2.0", XmlParsers.parsePom(onlyVersion.toByteArray()).relocation)
+        assertNull(XmlParsers.parsePom("<project/>".toByteArray()).relocation)
+    }
+
+    @Test
+    fun `parses developers, organization, packaging and parent without e-mail`() {
+        val pom = """
+            <project>
+              <parent><groupId>com.example</groupId><artifactId>parent</artifactId><version>2</version></parent>
+              <packaging>aar</packaging>
+              <organization><name>Example Inc.</name><url>https://example.com</url></organization>
+              <developers>
+                <developer><id>a</id><name>Ann</name><email>ann@example.com</email><url>https://ann.dev</url>
+                  <organizationUrl>https://example.com</organizationUrl><roles><role>dev</role><role>lead</role></roles></developer>
+                <developer><email>only-email@example.com</email></developer>
+              </developers>
+            </project>
+        """.trimIndent()
+        val p = XmlParsers.parsePom(pom.toByteArray())
+        assertEquals("com.example:parent:2", p.parent.toString())
+        assertEquals("aar", p.packaging)
+        assertEquals("Example Inc.", p.organization?.name)
+        val dev = p.developers!!.single() // the e-mail-only entry has no identifying fields left and is dropped
+        assertEquals("Ann", dev.name)
+        assertEquals(listOf("dev", "lead"), dev.roles)
+        assertTrue(dev.toString().contains("@").not())
+    }
+
+    @Test
+    fun `absent elements are null, not empty`() {
+        val p = XmlParsers.parsePom("<project/>".toByteArray())
+        assertNull(p.packaging)
+        assertNull(p.developers)
+        assertNull(p.licenses)
+        assertNull(p.organization)
+        assertNull(p.parent)
     }
 
     @Test
@@ -84,10 +119,10 @@ class XmlParsersTest {
               <dependencies><dependency><description>nested, ignored</description></dependency></dependencies>
             </project>
         """.trimIndent()
-        val p = XmlParsers.parsePom(pom.toByteArray(), "1.0")
+        val p = XmlParsers.parsePom(pom.toByteArray())
         assertEquals("Example", p.name)
         assertEquals("A multi-line description", p.description)
-        assertEquals("https://example.com", p.projectUrl)
+        assertEquals("https://example.com", p.url)
         assertEquals("https://github.com/example/lib", p.scmUrl)
         assertEquals(listOf("Apache-2.0"), p.licenses)
     }
