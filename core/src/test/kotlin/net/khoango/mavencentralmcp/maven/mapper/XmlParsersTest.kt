@@ -1,5 +1,6 @@
 package net.khoango.mavencentralmcp.maven.mapper
 
+import net.khoango.mavencentralmcp.core.model.License
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -95,6 +96,26 @@ class XmlParsersTest {
     }
 
     @Test
+    fun `parses license names and URLs without inventing missing parts`() {
+        val pom = """
+            <project><licenses>
+              <license><name>Apache License, Version 2.0</name><url>https://www.apache.org/licenses/LICENSE-2.0</url></license>
+              <license><url>https://opensource.org/licenses/MIT</url></license>
+              <license><name>Proprietary</name></license>
+              <license><distribution>repo</distribution></license>
+            </licenses></project>
+        """.trimIndent()
+        assertEquals(
+            listOf(
+                License("Apache License, Version 2.0", "https://www.apache.org/licenses/LICENSE-2.0"),
+                License(null, "https://opensource.org/licenses/MIT"),
+                License("Proprietary", null),
+            ),
+            XmlParsers.parsePom(pom.toByteArray()).licenses,
+        )
+    }
+
+    @Test
     fun `absent elements are null, not empty`() {
         val p = XmlParsers.parsePom("<project/>".toByteArray())
         assertNull(p.packaging)
@@ -124,6 +145,6 @@ class XmlParsersTest {
         assertEquals("A multi-line description", p.description)
         assertEquals("https://example.com", p.url)
         assertEquals("https://github.com/example/lib", p.scmUrl)
-        assertEquals(listOf("Apache-2.0"), p.licenses)
+        assertEquals(listOf(License("Apache-2.0", null)), p.licenses)
     }
 }

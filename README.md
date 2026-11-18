@@ -12,7 +12,7 @@ AI clients can search Maven Central and pick dependency versions. No hosted back
 | Tool | Purpose |
 |---|---|
 | `search_artifacts` | Search (`query`, optional exact `groupId`/`artifactId`/`packaging`, `limit` ≤ 50, `offset`, `includeDescriptions`). Returns ranked results with `rankingSignals`, POM `name`/`description`/`relocatedTo` for the first 5, `totalCount`, `hasMore`. |
-| `get_artifact_info` | Metadata for one `groupId` + `artifactId`: POM name/description/URL/SCM/licenses/packaging/developers/organization/relocation (with parent-POM inheritance), version count, raw "latest" markers, links, and per-field `provenance`. |
+| `get_artifact_info` | Metadata for one `groupId` + `artifactId`: POM name/description/URL/SCM/licenses (names, plus `licenseDetails` with URLs)/packaging/developers/organization/relocation (with parent-POM inheritance), version count, raw "latest" markers, links, and per-field `provenance`. |
 | `get_latest_version` | `latestPublishedVersion` (may be a prerelease), `latestStableVersion`, per-platform `variants`, per-major `stableLines`, `uncertain`/`candidates`, `guidance` and the policy text. |
 | `get_versions` | Versions newest-first (`limit` ≤ 100, `offset`, `includePrereleases`, `variant`), each with `prerelease`, `variant` and a publication date with `publishedProvenance`; `availableVariants` lists the labels. |
 
@@ -40,7 +40,7 @@ never labels an artifact "official"; the notes tell the client to confirm the gr
 - `groupId:artifactId` queries are exact lookups, and fall back to repository metadata if the index lacks the
   artifact. Search expressions (`g:io.ktor*`, `a:okhttp`, `AND`/`OR`, quotes) keep the index order.
 - Search expressions and index-ordered positions still carry signals: index position, a matching `groupId`
-  filter, versions indexed, recency.
+  filter (or "exact match for the groupId:artifactId query" for coordinate queries), versions indexed, recency.
 - `indexedLatestVersionPrerelease` classifies `indexedLatestVersion` with the version policy below; the version
   string is returned unchanged.
 - The search index has no description field. Name and description come from the POM of `indexedLatestVersion` for
@@ -83,14 +83,17 @@ POM sources always use one format: `pom:<groupId>:<artifactId>:<version>` and
 
 Every `provenance` entry has a `status`: `present`; `missing` (every relevant source was read and none declares the
 value); `unavailable` (a source could not be read, e.g. the index timed out or a parent POM is unreachable);
-`not_loaded` (not requested to bound network use); or `unresolved` (the value is a `${...}` Maven property, which is
-not evaluated). Values are never guessed.
+`not_loaded` (not requested to bound network use); `unresolved` (the value is a `${...}` Maven property, which is
+not evaluated); or `not_computed` (the artifact's own POM lacks the value, the parent POM named in `source` declares
+one, but Maven's derived inherited value is not reproduced). Values are never guessed.
 
 **POM inheritance.** `description`, `licenses`, `developers` and `organization` follow Maven inheritance through up
 to 3 parent POMs (e.g. Jackson's developers come from `jackson-bom`, 3 levels up). `name` and `packaging` are not
-inherited by Maven. `url` and `scm.url` are read from the artifact's own POM only, because Maven derives the
-inherited value by appending the module path, which is not reproduced here. Developer e-mail addresses are not
-returned.
+inherited by Maven. `url` and `scm.url` are taken from the artifact's own POM only, because Maven derives the
+inherited value by appending the module path, which is not reproduced here. If only an ancestor declares them (e.g.
+Guava's SCM URL is in `guava-parent`), `projectUrl`/`scmUrl` stay null with status `not_computed` and that ancestor
+as source, and the ancestor's own declared value is returned as `parentProjectUrl`/`parentScmUrl`. Developer e-mail
+addresses are not returned.
 
 **Publication dates.** The search index stores a publication time per version but stopped indexing new versions
 around mid-2025, which is why dates for recent versions were blank. Versions it lacks get the upload time of their
@@ -110,6 +113,10 @@ Connection errors and HTTP 502/503/504 are retried once; timeouts and HTTP 429 a
   search expressions and index-ordered positions; every result now has `provenance` for `name`, `description` and
   `relocatedTo`.
 - All tools: POM provenance sources changed from `pom <g:a:v>` to `pom:<g:a:v>` (and `parent-pom:<g:a:v>`).
+- `get_artifact_info`: `projectUrl`/`scmUrl` provenance is `not_computed` (previously `missing`) when only a parent
+  POM declares the value; added `pom.parentProjectUrl` and `pom.parentScmUrl`.
+- `get_artifact_info`: added `pom.licenseDetails` (`name` and `url` per license, as declared); `pom.licenses` is
+  unchanged. Its provenance is the `licenses` entry.
 
 ## Install
 

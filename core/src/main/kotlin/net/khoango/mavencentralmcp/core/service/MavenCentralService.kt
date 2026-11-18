@@ -89,13 +89,13 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
             if (pageEnd > SearchRanking.POOL_SIZE && upstreamStart < total) {
                 val rows = minOf(pageEnd - upstreamStart, limit)
                 val deep = client.searchArtifacts(solrQuery, rows = rows, start = upstreamStart)
-                ordered += upstreamOrdered(deep.docs.orEmpty(), upstreamStart, groupId)
+                ordered += upstreamOrdered(deep.docs.orEmpty(), upstreamStart, groupId, coordinate != null)
                 indexOrdered = ordered.size - reranked
             }
         } else {
             val page = client.searchArtifacts(solrQuery, rows = limit, start = offset)
             total = page.numFound ?: page.docs.orEmpty().size.toLong()
-            ordered += upstreamOrdered(page.docs.orEmpty(), offset, groupId)
+            ordered += upstreamOrdered(page.docs.orEmpty(), offset, groupId, coordinate != null)
             indexOrdered = ordered.size
         }
 
@@ -165,10 +165,10 @@ class MavenCentralService(private val client: MavenCentralClient = MavenCentralC
     }
 
     /** Index-ordered results with factual signals; [start] is the 0-based index position of the first doc. */
-    private fun upstreamOrdered(docs: List<SolrArtifactDoc>, start: Int, groupFilter: String?) =
+    private fun upstreamOrdered(docs: List<SolrArtifactDoc>, start: Int, groupFilter: String?, coordinateQuery: Boolean) =
         candidatesOf(docs, start).let { candidates ->
             val newest = candidates.mapNotNull { it.second.timestamp }.maxOrNull()
-            candidates.map { (doc, c) -> doc to SearchRanking.upstreamSignals(c, c.upstreamPosition + 1, newest, groupFilter) }
+            candidates.map { (doc, c) -> doc to SearchRanking.upstreamSignals(c, c.upstreamPosition + 1, newest, groupFilter, coordinateQuery) }
         }
 
     /**

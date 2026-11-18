@@ -138,6 +138,18 @@ class SearchQualityTest {
     }
 
     @Test
+    fun `coordinate query is not described as a groupId filter`() = runTest {
+        val pool = solr(1, listOf(doc("org.springframework.boot:spring-boot-starter-web", 252, "3.5.3")))
+        val (svc, fetcher) = service { uri -> if (uri.host == "search.maven.org") ok(pool) else status(404) }
+        val r = svc.search(
+            SearchRequest("org.springframework.boot:spring-boot-starter-web", limit = 10, offset = 0, includeDescriptions = false),
+        ).results.single()
+        assertEquals("g:\"org.springframework.boot\" AND a:\"spring-boot-starter-web\"", fetcher.requests.single().param("q"))
+        assertTrue(r.rankingSignals.contains("exact match for the groupId:artifactId query"), r.rankingSignals.toString())
+        assertFalse(r.rankingSignals.any { "filter" in it }, r.rankingSignals.toString())
+    }
+
+    @Test
     fun `groupId filter is applied exactly and reported as a signal`() = runTest {
         val pool = solr(1, listOf(doc("com.fasterxml.jackson.core:jackson-databind", 208)))
         val (svc, fetcher) = service { uri -> if (uri.host == "search.maven.org") ok(pool) else status(404) }
@@ -260,7 +272,7 @@ class SearchQualityTest {
             "pom:com.fasterxml.jackson.core:jackson-databind:2.19.0, parent-pom:com.fasterxml.jackson:jackson-base:2.19.0",
             info.pom!!.provenance.getValue("licenses").source,
         )
-        assertPomLabels(info.provenance.values.map { it.source } + info.pom!!.provenance.values.map { it.source })
+        assertPomLabels(info.provenance.values.map { it.source } + info.pom.provenance.values.map { it.source })
     }
 
     // ---- 4. Pagination -----------------------------------------------------------------------------------------

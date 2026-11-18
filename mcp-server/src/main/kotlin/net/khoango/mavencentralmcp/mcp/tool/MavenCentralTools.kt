@@ -118,12 +118,15 @@ class MavenCentralTools(private val service: MavenCentralService) {
         title = "Get Maven artifact metadata",
         description = """
             Get metadata for one exact Maven coordinate (groupId + artifactId), from the POM of the latest stable
-            version: name, description, project URL, SCM URL, licenses, packaging, developers (without e-mail),
+            version: name, description, project URL, SCM URL, licenses (names in 'licenses', name+URL in
+            'licenseDetails'), packaging, developers (without e-mail),
             organization and relocation; plus version count, repository and search-index 'latest' markers, and links.
             description/licenses/developers/organization follow Maven inheritance through up to 3 parent POMs.
             'provenance' (top level and in 'pom') gives each field's source (pom:<g:a:v>, parent-pom:<g:a:v>,
             repository-metadata, search-index, maven-default) or why it is absent: missing (checked, not declared),
-            unavailable (source could not be read), not_loaded (not requested), unresolved (unevaluated ${'$'}{...}).
+            unavailable (source could not be read), not_loaded (not requested), unresolved (unevaluated ${'$'}{...}),
+            not_computed (only a parent POM declares projectUrl/scmUrl; its own value is in parentProjectUrl/parentScmUrl,
+            but the artifact's derived URL is not computed).
             'packaging' comes from the POM (Maven's 'jar' default when undeclared, labelled maven-default);
             'indexedPackaging' is the search index's value. Returns an error result if the artifact does not exist.
             The 'indexedLatestVersion', 'repositoryLatestVersion' and 'repositoryReleaseVersion' fields are raw

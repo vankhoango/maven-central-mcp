@@ -172,4 +172,5 @@ class SearchServiceTest {
         }
         assertTrue(e.message!!.contains("groupId:artifactId"))
     }
+
 }

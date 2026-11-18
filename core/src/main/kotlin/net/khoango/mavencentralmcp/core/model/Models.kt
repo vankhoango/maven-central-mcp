@@ -79,7 +79,9 @@ data class SearchResultPage(
  * - [MISSING]: every source that was checked was read successfully and none contains the value;
  * - [UNAVAILABLE]: a source that could contain the value could not be read (HTTP error, timeout, not found);
  * - [NOT_LOADED]: a source that could contain the value was deliberately not requested (request budget);
- * - [UNRESOLVED]: the source contains a Maven `${...}` property expression, which is not evaluated.
+ * - [UNRESOLVED]: the source contains a Maven `${...}` property expression, which is not evaluated;
+ * - [NOT_COMPUTED]: the artifact's own POM lacks the value and [source] (a parent POM) declares one, but Maven
+ *   derives the inherited value (e.g. by appending the module path to a URL) in a way that is not reproduced.
  *
  * [source] names the origin: `search-index`, `repository-metadata`, `pom:<g:a:v>`, `parent-pom:<g:a:v>`,
  * `repository-file-timestamp`, or `maven-default`.
@@ -92,6 +94,7 @@ data class Provenance(val status: String, val source: String? = null) {
         const val UNAVAILABLE = "unavailable"
         const val NOT_LOADED = "not_loaded"
         const val UNRESOLVED = "unresolved"
+        const val NOT_COMPUTED = "not_computed"
 
         const val SEARCH_INDEX = "search-index"
         const val REPOSITORY_METADATA = "repository-metadata"
@@ -120,6 +123,10 @@ data class Developer(
     val roles: List<String> = emptyList(),
 )
 
+/** A POM `<license>` entry. Either field may be absent upstream; nothing is filled in. */
+@Serializable
+data class License(val name: String? = null, val url: String? = null)
+
 /** The POM `<organization>` element. */
 @Serializable
 data class Organization(val name: String? = null, val url: String? = null)
@@ -136,7 +143,17 @@ data class PomMetadata(
     val description: String? = null,
     val projectUrl: String? = null,
     val scmUrl: String? = null,
+    /**
+     * `<url>` as declared by the nearest parent POM when the artifact's own POM has none (provenance of
+     * `projectUrl` is then `not_computed`). This is the parent's own value, not the artifact's effective URL.
+     */
+    val parentProjectUrl: String? = null,
+    /** `<scm><url>` as declared by the nearest parent POM when the artifact's own POM has none; see [parentProjectUrl]. */
+    val parentScmUrl: String? = null,
+    /** License names (or the URL when a license has no name); kept for backward compatibility. */
     val licenses: List<String> = emptyList(),
+    /** Each license with its name and URL as declared. Same source and provenance (`licenses`) as [licenses]. */
+    val licenseDetails: List<License> = emptyList(),
     /** `<packaging>`, or `jar` (Maven's default) when the POM omits it; see provenance. */
     val packaging: String? = null,
     val developers: List<Developer> = emptyList(),

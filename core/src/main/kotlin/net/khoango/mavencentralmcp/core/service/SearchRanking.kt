@@ -153,10 +153,17 @@ internal object SearchRanking {
      * Factual signals for results that keep the search-index order (search expressions, explicit filters
      * without free text, or positions beyond the re-ranked pool). [absolutePosition] is 1-based.
      */
-    fun upstreamSignals(c: Candidate, absolutePosition: Int, newest: Long?, groupFilter: String?): List<String> {
+    fun upstreamSignals(
+        c: Candidate,
+        absolutePosition: Int,
+        newest: Long?,
+        groupFilter: String?,
+        coordinateQuery: Boolean = false,
+    ): List<String> {
         val signals = mutableListOf("position $absolutePosition in search-index order (not re-ranked)")
         if (groupFilter != null && c.groupId.equals(groupFilter, ignoreCase = true)) {
-            signals += "groupId matches the groupId filter"
+            // A 'groupId:artifactId' query sets the group internally; only call it a filter if the caller passed one.
+            signals += if (coordinateQuery) "exact match for the groupId:artifactId query" else "groupId matches the groupId filter"
         }
         historyAndRecency(c, newest, signals)
         return signals

@@ -14,7 +14,9 @@ import net.khoango.mavencentralmcp.maven.mapper.RawPom
  * fields that Maven inherits verbatim: `description`, `licenses`, `developers` and `organization`.
  *
  * Deliberately not inherited: `name` and `packaging` (Maven does not inherit them) and `url`/`scm.url`
- * (Maven inherits them with the module path appended, which is not reproduced here). Property expressions
+ * (Maven inherits them with the module path appended, which is not reproduced here). When only an ancestor
+ * declares `url`/`scm.url`, the field is [Provenance.NOT_COMPUTED], not missing, and the ancestor's declared
+ * value is exposed separately as `parentProjectUrl`/`parentScmUrl`. Property expressions
  * such as `${project.url}` are not evaluated; such values are reported as [Provenance.UNRESOLVED].
  * Every parent fetch is a cached GET on the fixed repository host.
  */
@@ -81,10 +83,28 @@ internal class PomResolver(private val client: MavenCentralClient) {
             return value
         }
 
+        /**
+         * URL field that Maven inherits only in derived form (parent URL plus the module path), which is not
+         * reproduced. If the artifact's own POM lacks it but an ancestor declares it, the field is reported as
+         * [Provenance.NOT_COMPUTED] with that ancestor as source, and the ancestor's value is returned separately
+         * via [declaredInParent]; it is never presented as the artifact's own value. Returns (value, parentValue).
+         */
+        fun derivedUrl(field: String, select: (RawPom) -> String?): Pair<String?, String?> {
+            val ownValue = select(own)
+            if (ownValue != null) return own(field, ownValue) to null
+            val index = (1 until chain.size).firstOrNull { select(chain[it].pom) != null }
+            if (index == null) {
+                provenance[field] = absentEverywhere
+                return null to null
+            }
+            provenance[field] = Provenance(Provenance.NOT_COMPUTED, sourceOf(index))
+            return null to select(chain[index].pom)?.takeUnless { "\${" in it }
+        }
+
         val name = own("name", own.name)
         val description = inherited("description", RawPom::description) { "\${" in it }
-        val projectUrl = own("projectUrl", own.url)
-        val scmUrl = own("scmUrl", own.scmUrl)
+        val (projectUrl, parentProjectUrl) = derivedUrl("projectUrl", RawPom::url)
+        val (scmUrl, parentScmUrl) = derivedUrl("scmUrl", RawPom::scmUrl)
         val licenses = inherited("licenses", RawPom::licenses)
         val packaging = when (val p = own.packaging) {
             null -> "jar".also {
@@ -102,7 +122,10 @@ internal class PomResolver(private val client: MavenCentralClient) {
             description = description,
             projectUrl = projectUrl,
             scmUrl = scmUrl,
-            licenses = licenses.orEmpty(),
+            parentProjectUrl = parentProjectUrl,
+            parentScmUrl = parentScmUrl,
+            licenses = licenses.orEmpty().mapNotNull { it.name ?: it.url },
+            licenseDetails = licenses.orEmpty(),
             packaging = packaging,
             developers = developers.orEmpty(),
             organization = organization,

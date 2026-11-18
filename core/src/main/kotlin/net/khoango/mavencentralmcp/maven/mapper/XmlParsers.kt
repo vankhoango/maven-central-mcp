@@ -1,6 +1,7 @@
 package net.khoango.mavencentralmcp.maven.mapper
 
 import net.khoango.mavencentralmcp.core.model.Developer
+import net.khoango.mavencentralmcp.core.model.License
 import net.khoango.mavencentralmcp.core.model.Organization
 import org.w3c.dom.Element
 import org.xml.sax.InputSource
@@ -29,7 +30,7 @@ internal data class RawPom(
     val url: String?,
     val scmUrl: String?,
     val packaging: String?,
-    val licenses: List<String>?,
+    val licenses: List<License>?,
     val developers: List<Developer>?,
     val organization: Organization?,
     val relocation: String?,
@@ -94,8 +95,8 @@ internal object XmlParsers {
         val root = parseRoot(bytes)
         require(root.tagName == "project") { "Unexpected root element" }
         val licenses = root.child("licenses")?.children("license")
-            ?.mapNotNull { it.childText("name") ?: it.childText("url") }
-            ?.map { it.cap(200) }
+            ?.map { License(it.childText("name")?.cap(200), it.childText("url")?.cap(500)) }
+            ?.filter { it.name != null || it.url != null }
             ?.take(MAX_ITEMS)
         val developers = root.child("developers")?.children("developer")
             ?.map { d ->

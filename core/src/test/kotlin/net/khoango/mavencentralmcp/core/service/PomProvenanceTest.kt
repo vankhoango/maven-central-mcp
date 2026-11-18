@@ -29,7 +29,7 @@ class PomProvenanceTest {
         "<url>https://example.com/lib</url></project>"
     private val parentPom = "<project>${parent("org.example", "oss-parent", "9")}<artifactId>lib-parent</artifactId>" +
         "<name>Parent name (not inherited)</name><url>https://example.com</url>" +
-        "<licenses><license><name>Apache-2.0</name></license></licenses>" +
+        "<licenses><license><name>Apache-2.0</name><url>https://www.apache.org/licenses/LICENSE-2.0</url></license></licenses>" +
         "<developers><developer><id>jdoe</id><name>Jane Doe</name><email>jane@example.com</email>" +
         "<organization>Example Inc.</organization><roles><role>lead</role></roles></developer></developers></project>"
     private val grandParentPom = "<project><artifactId>oss-parent</artifactId>" +
@@ -58,7 +58,11 @@ class PomProvenanceTest {
         val pom = info(repo()).pom!!
         assertEquals("Own description", pom.description)
         assertEquals(Provenance.present("pom:com.example:lib:1.0"), pom.provenance["description"])
-        assertEquals(listOf("Apache-2.0"), pom.licenses)
+        assertEquals(listOf("Apache-2.0"), pom.licenses) // unchanged, backward-compatible name list
+        assertEquals(
+            listOf(net.khoango.mavencentralmcp.core.model.License("Apache-2.0", "https://www.apache.org/licenses/LICENSE-2.0")),
+            pom.licenseDetails,
+        )
         assertEquals(Provenance.present("parent-pom:com.example:lib-parent:1.0"), pom.provenance["licenses"])
         assertEquals(listOf(Developer(id = "jdoe", name = "Jane Doe", organization = "Example Inc.", roles = listOf("lead"))), pom.developers)
         assertEquals(Organization("Example Foundation", "https://example.org"), pom.organization)
@@ -74,9 +78,75 @@ class PomProvenanceTest {
         assertEquals(Provenance(Provenance.MISSING, "pom:com.example:lib:1.0"), pom.provenance["name"])
         assertNull(pom.projectUrl)
         assertNull(pom.scmUrl)
+        // Only the parent declares <url>: not the artifact's value, but not "missing" either.
+        assertEquals(Provenance(Provenance.NOT_COMPUTED, "parent-pom:com.example:lib-parent:1.0"), pom.provenance["projectUrl"])
+        assertEquals("https://example.com", pom.parentProjectUrl)
+        // No POM in the complete chain declares <scm>: genuinely missing.
+        assertEquals(Provenance.MISSING, pom.provenance.getValue("scmUrl").status)
+        assertNull(pom.parentScmUrl)
         // description is inheritable but no POM in the complete chain has one.
         assertNull(pom.description)
         assertEquals(Provenance.MISSING, pom.provenance.getValue("description").status)
+    }
+
+    // ---- URL fields that Maven inherits only in derived form (Guava regression) -----------------------------------
+
+    private val noUrlChild = "<project>${parent("com.example", "lib-parent", "1.0")}<artifactId>lib</artifactId></project>"
+
+    @Test
+    fun `Guava case - scm url declared only in the direct parent is not_computed, never missing`() = runTest {
+        val parentWithScm = "<project><artifactId>lib-parent</artifactId><url>https://github.com/example/lib</url>" +
+            "<scm><connection>scm:git:https://github.com/example/lib.git</connection><url>https://github.com/example/lib</url></scm></project>"
+        val pom = info(repo(child = noUrlChild, parentResponse = { ok(parentWithScm) })).pom!!
+        assertNull(pom.scmUrl)
+        assertNull(pom.projectUrl)
+        assertEquals(Provenance(Provenance.NOT_COMPUTED, "parent-pom:com.example:lib-parent:1.0"), pom.provenance["scmUrl"])
+        assertEquals(Provenance(Provenance.NOT_COMPUTED, "parent-pom:com.example:lib-parent:1.0"), pom.provenance["projectUrl"])
+        assertEquals("https://github.com/example/lib", pom.parentScmUrl)
+        assertEquals("https://github.com/example/lib", pom.parentProjectUrl)
+    }
+
+    @Test
+    fun `url declared only in a more distant ancestor names that ancestor`() = runTest {
+        val middle = "<project>${parent("org.example", "oss-parent", "9")}<artifactId>lib-parent</artifactId></project>"
+        val top = "<project><artifactId>oss-parent</artifactId><scm><url>https://scm.example.org/root</url></scm></project>"
+        val pom = info(repo(child = noUrlChild, parentResponse = { ok(middle) }, grandParentResponse = { ok(top) })).pom!!
+        assertEquals(Provenance(Provenance.NOT_COMPUTED, "parent-pom:org.example:oss-parent:9"), pom.provenance["scmUrl"])
+        assertEquals("https://scm.example.org/root", pom.parentScmUrl)
+        // Nobody declares <url>: missing after the complete chain was read.
+        assertEquals(
+            Provenance(Provenance.MISSING, "pom:com.example:lib:1.0, parent-pom:com.example:lib-parent:1.0, parent-pom:org.example:oss-parent:9"),
+            pom.provenance["projectUrl"],
+        )
+        assertNull(pom.parentProjectUrl)
+    }
+
+    @Test
+    fun `unreachable parent makes absent urls unavailable, not missing`() = runTest {
+        val pom = info(repo(child = noUrlChild, parentResponse = { status(500) })).pom!!
+        assertEquals(Provenance(Provenance.UNAVAILABLE, "parent-pom:com.example:lib-parent:1.0"), pom.provenance["scmUrl"])
+        assertEquals(Provenance.UNAVAILABLE, pom.provenance.getValue("projectUrl").status)
+        assertNull(pom.parentScmUrl)
+    }
+
+    @Test
+    fun `own urls stay present and parent values are not reported`() = runTest {
+        val child = "<project>${parent("com.example", "lib-parent", "1.0")}<artifactId>lib</artifactId>" +
+            "<url>https://lib.example</url><scm><url>https://scm.example/lib</url></scm></project>"
+        val pom = info(repo(child = child)).pom!!
+        assertEquals("https://lib.example", pom.projectUrl)
+        assertEquals("https://scm.example/lib", pom.scmUrl)
+        assertEquals(Provenance.present("pom:com.example:lib:1.0"), pom.provenance["scmUrl"])
+        assertNull(pom.parentProjectUrl)
+        assertNull(pom.parentScmUrl)
+    }
+
+    @Test
+    fun `parent url with a property expression is not returned as a value`() = runTest {
+        val parentWithProperty = "<project><artifactId>lib-parent</artifactId><url>\${project.scm.url}</url></project>"
+        val pom = info(repo(child = noUrlChild, parentResponse = { ok(parentWithProperty) })).pom!!
+        assertEquals(Provenance(Provenance.NOT_COMPUTED, "parent-pom:com.example:lib-parent:1.0"), pom.provenance["projectUrl"])
+        assertNull(pom.parentProjectUrl)
     }
 
     @Test
